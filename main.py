@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """Floating retro-80s 'air-check' recorder: per-device audio tap, 5-band EQ curve,
-DeHummer, and scrolling waveform / spectral timeline monitors."""
+DeHummer, and a 3D waveform / spectral scope."""
 import os
+import struct
 import sys
 from pathlib import Path
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QDataStream, QByteArray
 from PySide6.QtGui import (
     QPainter, QColor, QLinearGradient, QPen, QFont, QBrush, QPainterPath, QRadialGradient,
     QIcon, QPixmap, QAction, QImage,
@@ -19,8 +20,8 @@ from PySide6.QtWidgets import (
 
 sys.path.insert(0, str(Path(__file__).parent))
 from engine import (
-    AudioEngine, list_capture_devices, list_monitor_devices, TIMELINE_SECONDS, WAVE_HISTORY,
-    SPEC_HISTORY, SPEC_ROWS, SPEC_FREQ_LO, SPEC_FREQ_HI, spec_scale,
+    AudioEngine, list_capture_devices, list_monitor_devices, peak_decimate, TIMELINE_SECONDS,
+    SCOPE_FRAMES, SCOPE_POINTS, SCOPE_WINDOW, SPEC_ROWS, SPEC_FREQ_LO, SPEC_FREQ_HI,
 )
 from eq import (
     BAND_DEFS, FREQ_MIN, FREQ_MAX, DEHUMMER_PRESETS, HUM_FREQ_MIN, HUM_FREQ_MAX, HUM_Q_MIN,
@@ -506,91 +507,294 @@ class BandListPanel(QWidget):
         return f"{band.name:<4} {'':7} {where:>8} Q{band.q:.2f}"
 
 
-# ---- scrolling timeline monitors ---------------------------------------------
-LANE_RULER_W = 44   # dB / Hz scale column, right of the lanes
-LANE_BTN_W = 20     # channel (mute) buttons column, right of the ruler
-LANE_BG = QColor(8, 3, 4)
-CH_COLORS = [QColor(255, 70, 70), QColor(80, 240, 160)]  # L red, R green (matches the EQ spectrum)
-MONO_COLOR = QColor(255, 210, 60)
-WAVE_DB_MARKS = (-3, -6, -12, -18)
-SPEC_HZ_MARKS = (100, 200, 400, 600, 800, 1000, 2000, 3000, 4000, 5000, 7000, 10000)
-SPEC_DB_FLOOR, SPEC_DB_CEIL = -105.0, -5.0
-HEAT_FADE_SECONDS = 3.0  # columns fade out over the last 3 s of the 10 s window
-HEAT_LUT = np.stack([
-    np.interp(np.linspace(0, 1, 256), [0, .15, .35, .55, .75, .9, 1], ch)
-    for ch in ([0, 30, 90, 180, 250, 255, 255],     # R
-               [0, 8, 30, 40, 120, 225, 255],      # G
-               [0, 50, 130, 140, 40, 80, 230])     # B
-], axis=1).astype(np.uint8)  # dark -> purple -> magenta -> orange -> yellow -> white (Audition heat)
+# ---- 3D scope ------------------------------------------------------------------
+LANE_BTN_W = 20  # channel (mute) buttons column on the right
+SCOPE_BG = QColor(2, 2, 9)
+SCOPE_TEXT = QColor(170, 170, 215, 170)
+SCOPE_AXIS = QColor(200, 200, 230, 80)
+SCOPE_BTN = QColor(140, 160, 255)
+SCOPE_FADE_SECONDS = 3.0  # history fades out over the last 3 s of the 10 s window
+SCOPE_DEPTH = 1.5         # world units the 10 s history spans on each side of the live trace
+SCOPE_Y = 1.6             # half-length of the Y axis (the live trace / frequency axis)
+SCOPE_WAVE_Z = 0.55       # waveform full-scale height
+SCOPE_SPEC_Z = 0.8        # spectrum full height
+SCOPE_DB_FLOOR, SCOPE_DB_CEIL = -90.0, -10.0
+SCOPE_ALPHA_BUCKETS = 10
+SCOPE_HZ_MARKS = (50, 100, 200, 500, 1000, 2000, 5000, 10000)
+SCOPE_DEFAULT_VIEW = (16.0, 30.0, 1.0)  # yaw deg, pitch deg, zoom
+SCOPE_CAMERA = 5.0
+WAVE_RGB_NEW, WAVE_RGB_OLD = np.array([125, 175, 255]), np.array([150, 90, 255])
+SPEC_RGB_NEW, SPEC_RGB_OLD = np.array([200, 140, 255]), np.array([80, 70, 230])
+LIVE_RGB = (215, 230, 255)
+
+_PATH_DTYPE = np.dtype([("c", ">i4"), ("x", ">f8"), ("y", ">f8")])
 
 
-class ChannelLanes(QWidget):
-    """Base for the per-channel timeline monitors. Stereo: L over R. A muted
-    channel's lane disappears (the other takes the whole area) and only its
-    button stays; both muted = dark. Mono input: one lane, one 'M' button."""
+def polylines_path(xs, ys):
+    """(k, m) screen coords -> one QPainterPath holding k polylines, built in
+    bulk through QPainterPath's QDataStream format. Thousands of per-point
+    lineTo() calls per frame would hog the GIL and glitch the audio thread."""
+    k, m = xs.shape
+    arr = np.empty((k, m), dtype=_PATH_DTYPE)
+    arr["c"] = 1
+    arr["c"][:, 0] = 0  # MoveTo starts each polyline
+    arr["x"] = xs
+    arr["y"] = ys
+    buf = struct.pack(">i", k * m) + arr.tobytes() + struct.pack(">ii", 0, 0)
+    path = QPainterPath()
+    QDataStream(QByteArray(buf)) >> path
+    return path
 
-    TOP = 2  # space above the lanes (subclasses may reserve a time ruler)
 
-    def __init__(self, engine, on_mute_change=None):
+def _smoothstep(f):
+    f = np.clip(f, 0.0, 1.0)
+    return f * f * (3 - 2 * f)
+
+
+class Scope3D(QWidget):
+    """3D audio scope. Y axis: the live waveform. X+: the last 10 s of waveform
+    frames receding behind it (topography). X-: the matching spectrum frames
+    (spectral map, log Hz along Y) coming forward, laced into a terrain.
+    Everything fades out smoothly at 10 s.
+
+    MIX/CH toggle: one scene for the mix, or L | R side by side. Channel mute
+    buttons on the right: a muted channel's scene disappears and the other
+    takes the whole area; both muted = dark. Mono input = one scene.
+    Drag = orbit, wheel = zoom, double-click = reset view."""
+
+    def __init__(self, engine, mode="mix", on_mute_change=None, on_mode_change=None):
         super().__init__()
         self.engine = engine
+        self.mode = mode if mode in ("mix", "channels") else "mix"
         self.on_mute_change = on_mute_change
+        self.on_mode_change = on_mode_change
         self.mono = False
-        self.setMinimumHeight(110)
+        self.live = np.zeros((SCOPE_WINDOW, 2), dtype=np.float32)
+        self.wave = np.zeros((SCOPE_FRAMES, 3, 2, SCOPE_POINTS), dtype=np.float32)
+        self.spec = np.full((SCOPE_FRAMES, 3, SPEC_ROWS), -200.0, dtype=np.float32)
+        self.ages = np.full(SCOPE_FRAMES, 1e9)
+        self.yaw, self.pitch, self.zoom = SCOPE_DEFAULT_VIEW
+        self._orbit = None
+        self.setMinimumHeight(220)
 
-    def content_rect(self):
-        return QRectF(self.rect()).adjusted(46, self.TOP, -(LANE_RULER_W + LANE_BTN_W), -2)
+    def update_data(self, live, wave, spec, ages, mono):
+        self.live, self.wave, self.spec, self.ages, self.mono = live, wave, spec, ages, mono
+        self.update()
 
-    def _is_muted(self, ch):
-        return all(self.engine.mute) if ch == "M" else self.engine.mute[ch]
+    # ---- layout -----------------------------------------------------------------
+    @staticmethod
+    def _toggle_rects():
+        return QRectF(6, 4, 34, 15), QRectF(40, 4, 34, 15)
 
     def _layout(self):
-        r = self.content_rect()
-        chans = ["M"] if self.mono else [0, 1]
-        visible = [c for c in chans if not self._is_muted(c)]
-        hidden = [c for c in chans if self._is_muted(c)]
-        lanes = []
-        if visible:
-            h = r.height() / len(visible)
-            lanes = [(c, QRectF(r.left(), r.top() + i * h, r.width(), h)) for i, c in enumerate(visible)]
-        bx = r.right() + LANE_RULER_W + 2
-        buttons = {c: QRectF(bx, lane.top() + 2, 16, 16) for c, lane in lanes}
-        for j, c in enumerate(reversed(hidden)):  # muted buttons park at the bottom, L above R
-            buttons[c] = QRectF(bx, r.bottom() - 18 * (j + 1), 16, 16)
-        return r, lanes, buttons
+        """-> (area, [(label, data index, rect)], {button: rect})"""
+        r = QRectF(self.rect()).adjusted(2, 2, -(LANE_BTN_W + 6), -2)
+        mute = self.engine.mute
+        bx = r.right() + 4
 
+        def btn(y):
+            return QRectF(bx, y, 16, 16)
+
+        if self.mono:
+            scenes = [] if all(mute) else [("MONO", 0, r)]
+            return r, scenes, {"M": btn(r.top() + 22)}
+        if self.mode == "mix":
+            scenes = []
+            if not all(mute):
+                idx = 2 if not any(mute) else (1 if mute[0] else 0)
+                scenes = [("MIX" if idx == 2 else "LR"[idx] + " ONLY", idx, r)]
+            return r, scenes, {0: btn(r.top() + 22), 1: btn(r.top() + 40)}
+        # channels: L | R side by side; a muted side's scene goes, the other takes the width
+        visible = [c for c in (0, 1) if not mute[c]]
+        scenes = []
+        if visible:
+            w = r.width() / len(visible)
+            scenes = [("LR"[c], c, QRectF(r.left() + i * w, r.top(), w, r.height()))
+                      for i, c in enumerate(visible)]
+        return r, scenes, {0: btn(r.top() + 22), 1: btn(r.top() + 40)}
+
+    # ---- projection -------------------------------------------------------------
+    def _camera(self, rect):
+        """Fit the world box into rect -> (scale, cx, cy) for _project."""
+        corners = np.array([(x, y, z) for x in (-SCOPE_DEPTH - 0.1, SCOPE_DEPTH + 0.1)
+                            for y in (-SCOPE_Y - 0.2, SCOPE_Y + 0.1)
+                            for z in (-SCOPE_WAVE_Z, SCOPE_SPEC_Z)])
+        sx, sy = self._project(corners[:, 0], corners[:, 1], corners[:, 2], 1.0, 0.0, 0.0)
+        # the box's empty corners overstate its height: favour filling the width
+        scale = min((rect.width() - 20) / np.ptp(sx), 1.35 * (rect.height() - 20) / np.ptp(sy)) * self.zoom
+        cx = rect.center().x() - scale * (sx.max() + sx.min()) / 2
+        cy = rect.center().y() + 6 - scale * (sy.max() + sy.min()) / 2
+        return scale, cx, cy
+
+    def _project(self, x, y, z, scale, cx, cy):
+        yaw, pitch = np.radians(self.yaw), np.radians(self.pitch)
+        depth = x * np.cos(yaw) - y * np.sin(yaw)   # + = away from the viewer
+        right = x * np.sin(yaw) + y * np.cos(yaw)
+        up = z * np.cos(pitch) + depth * np.sin(pitch)
+        toward = -depth * np.cos(pitch) + z * np.sin(pitch)
+        f = SCOPE_CAMERA / (SCOPE_CAMERA - toward)
+        return cx + scale * right * f, cy - scale * up * f
+
+    # ---- painting ---------------------------------------------------------------
     def paintEvent(self, event):
         p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(), QColor(3, 2, 5))
-        r, lanes, buttons = self._layout()
-        p.fillRect(r, QColor(0, 0, 0))
-        self.paint_header(p, r)
-        for ch, lane in lanes:
-            data_ch = 0 if ch == "M" else ch
-            p.fillRect(lane, LANE_BG)
-            self.paint_lane(p, data_ch, lane)
-            self.paint_ruler(p, lane, QRectF(lane.right(), lane.top(), LANE_RULER_W, lane.height()))
-            p.setPen(QPen(QColor(90, 30, 30), 1))
-            p.drawRect(lane)
+        area, scenes, buttons = self._layout()
+        p.fillRect(area, QColor(0, 0, 0))
+        for label, idx, rect in scenes:
+            p.save()
+            p.setClipRect(rect)
+            self._paint_scene(p, idx, rect, label)
+            p.restore()
+            p.setPen(QPen(QColor(50, 45, 90), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(rect)
         for ch, b in buttons.items():
             self._paint_button(p, ch, b)
+        self._paint_toggle(p)
         p.end()
 
+    def _paint_scene(self, p, idx, rect, label):
+        p.fillRect(rect, SCOPE_BG)
+        cam = self._camera(rect)
+
+        def proj(x, y, z):
+            return self._project(np.asarray(x, float), np.asarray(y, float), np.asarray(z, float), *cam)
+
+        self._paint_axes(p, proj)
+
+        ages = self.ages
+        valid = ages < TIMELINE_SECONDS
+        fade = (_smoothstep((TIMELINE_SECONDS - ages) / SCOPE_FADE_SECONDS)
+                * (1.0 - 0.45 * np.clip(ages / TIMELINE_SECONDS, 0, 1)))
+        # X+: waveform topography -- each frame's max/min envelope as one
+        # closed silhouette, receding behind the live trace
+        if valid.any():
+            ys = np.linspace(-SCOPE_Y, SCOPE_Y, SCOPE_POINTS)
+            ys = np.concatenate([ys, ys[::-1]])
+            env = np.clip(self.wave[valid, idx], -1, 1)  # (k, 2, P)
+            zs = np.concatenate([env[:, 0], env[:, 1, ::-1]], axis=1) * SCOPE_WAVE_Z
+            xs = (ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + 0.02)[:, None] * np.ones_like(ys)
+            sx, sy = proj(xs, np.broadcast_to(ys, xs.shape), zs)
+            self._stroke_buckets(p, sx, sy, fade[valid], ages[valid], WAVE_RGB_NEW, WAVE_RGB_OLD)
+
+        # live trace on the Y axis: the same window a history frame covers
+        three = np.column_stack([self.live, self.live.mean(axis=1)])
+        live = peak_decimate(three, SCOPE_POINTS * 4)[:, idx]
+        ly = np.linspace(-SCOPE_Y, SCOPE_Y, len(live))
+        sx, sy = proj(np.zeros_like(ly), ly, np.clip(live, -1, 1) * SCOPE_WAVE_Z)
+        path = polylines_path(sx[None, :], sy[None, :])
+        p.setCompositionMode(QPainter.CompositionMode_Plus)
+        for width, alpha in ((4.0, 45), (1.2, 230)):
+            p.setPen(QPen(QColor(*LIVE_RGB, alpha), width))
+            p.drawPath(path)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+        # X-: spectral map coming forward, laced into a terrain
+        if valid.any():
+            ry = np.linspace(-SCOPE_Y, SCOPE_Y, SPEC_ROWS)
+            level = np.clip((self.spec[valid, idx, :] - SCOPE_DB_FLOOR) / (SCOPE_DB_CEIL - SCOPE_DB_FLOOR), 0, 1) ** 1.6
+            xs = -(ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + 0.04)[:, None] * np.ones_like(ry)
+            sx, sy = proj(xs, np.broadcast_to(ry, xs.shape), level * SCOPE_SPEC_Z)
+            self._stroke_buckets(p, sx, sy, fade[valid], ages[valid], SPEC_RGB_NEW, SPEC_RGB_OLD)
+            if valid.sum() > 1:
+                lace = slice(4, SPEC_ROWS, 8)  # constant-frequency lines across time
+                p.setPen(QPen(QColor(110, 100, 240, 45), 1.0))
+                p.drawPath(polylines_path(np.ascontiguousarray(sx[:, lace].T),
+                                          np.ascontiguousarray(sy[:, lace].T)))
+
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        p.setFont(QFont("Consolas", 8, QFont.Bold))
+        p.setPen(SCOPE_TEXT)
+        p.drawText(QRectF(rect.right() - 90, rect.top() + 4, 84, 14), Qt.AlignRight, label)
+
+    @staticmethod
+    def _stroke_buckets(p, sx, sy, fade, ages, rgb_new, rgb_old):
+        """One path per opacity bucket (not per frame) keeps draw calls few."""
+        bucket = np.minimum((fade * SCOPE_ALPHA_BUCKETS).astype(int), SCOPE_ALPHA_BUCKETS - 1)
+        for b in range(SCOPE_ALPHA_BUCKETS):
+            sel = (bucket == b) & (fade > 0.01)
+            if not sel.any():
+                continue
+            t = float(np.clip(ages[sel].mean() / TIMELINE_SECONDS, 0, 1))
+            r, g, bl = (rgb_new * (1 - t) + rgb_old * t).astype(int)
+            alpha = (b + 0.5) / SCOPE_ALPHA_BUCKETS
+            p.setPen(QPen(QColor(r, g, bl, int(200 * alpha)), 1.0))
+            p.drawPath(polylines_path(sx[sel], sy[sel]))
+
+    def _paint_axes(self, p, proj):
+        d, wz, yl = SCOPE_DEPTH, SCOPE_WAVE_Z, SCOPE_Y
+        p.setFont(QFont("Consolas", 8))
+
+        def line(a, b):
+            (x0, x1), (y0, y1) = proj([a[0], b[0]], [a[1], b[1]], [a[2], b[2]])
+            p.setPen(QPen(SCOPE_AXIS, 1.0))
+            p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+
+        def text(pt, s, color=SCOPE_TEXT):
+            x, y = proj(*pt)
+            p.setPen(color)
+            p.drawText(QPointF(float(x), float(y)), s)
+
+        line((-d - 0.15, 0, 0), (d + 0.15, 0, 0))
+        line((0, -yl - 0.1, 0), (0, yl + 0.1, 0))
+        line((0, 0, -wz - 0.1), (0, 0, SCOPE_SPEC_Z + 0.1))
+        text((d + 0.2, 0, 0), "X+ WAVE")
+        text((-d - 0.25, 0, 0), "X- SPECTRUM")
+        text((0, yl + 0.15, 0), "Y")
+        text((0, 0, SCOPE_SPEC_Z + 0.14), "Z")
+
+        dim = QColor(SCOPE_TEXT.red(), SCOPE_TEXT.green(), SCOPE_TEXT.blue(), 110)
+        for sec in (2, 4, 6, 8, 10):  # time ticks both ways along X
+            x = sec / TIMELINE_SECONDS * d
+            for sign in (1, -1):
+                line((sign * x, -yl - 0.02, 0), (sign * x, -yl - 0.1, 0))
+                text((sign * x, -yl - 0.3, 0), f"-{sec}s", dim)
+        for amp, lbl in ((1.0, "0dB"), (0.5, "-6")):  # waveform full scale on the live trace
+            for sign in (1, -1):
+                line((0, -yl, sign * amp * wz), (0, -yl - 0.07, sign * amp * wz))
+            text((0, -yl - 0.3, amp * wz), lbl, dim)
+        lo, hi = np.log10(SPEC_FREQ_LO), np.log10(SPEC_FREQ_HI)
+        for f in SCOPE_HZ_MARKS:  # frequency along Y on the near (oldest spectrum) edge
+            y = yl * (-1.0 + 2.0 * (np.log10(f) - lo) / (hi - lo))
+            line((-d - 0.04, y, 0), (-d - 0.12, y, 0))
+            text((-d - 0.3, y - 0.03, 0), f"{f // 1000}k" if f >= 1000 else str(f), dim)
+
     def _paint_button(self, p, ch, rect):
-        muted = self._is_muted(ch)
-        color = MONO_COLOR if ch == "M" else CH_COLORS[ch]
-        p.setPen(QPen(color if not muted else QColor(110, 40, 40), 1))
-        p.setBrush(QColor(color.red() // 3, color.green() // 3, color.blue() // 3) if not muted
-                   else QColor(25, 8, 8))
+        muted = all(self.engine.mute) if ch == "M" else self.engine.mute[ch]
+        c = SCOPE_BTN
+        p.setPen(QPen(c if not muted else QColor(70, 60, 90), 1))
+        p.setBrush(QColor(c.red() // 3, c.green() // 3, c.blue() // 3) if not muted else QColor(12, 10, 20))
         p.drawRect(rect)
         p.setFont(QFont("Consolas", 8, QFont.Bold))
-        p.setPen(QColor(255, 235, 235) if not muted else QColor(120, 60, 60))
+        p.setPen(QColor(235, 235, 255) if not muted else QColor(90, 80, 110))
         p.drawText(rect, Qt.AlignCenter, "M" if ch == "M" else "LR"[ch])
 
+    def _paint_toggle(self, p):
+        p.setFont(QFont("Consolas", 7, QFont.Bold))
+        for rect, label, on in zip(self._toggle_rects(), ("MIX", "CH"),
+                                   (self.mode == "mix", self.mode == "channels")):
+            p.setPen(QPen(SCOPE_BTN if on else QColor(70, 60, 90), 1))
+            p.setBrush(QColor(45, 50, 110) if on else QColor(12, 10, 20))
+            p.drawRect(rect)
+            p.setPen(QColor(235, 235, 255) if on else QColor(110, 100, 140))
+            p.drawText(rect, Qt.AlignCenter, label)
+
+    # ---- mouse ------------------------------------------------------------------
     def mousePressEvent(self, event):
+        pos = event.position()
+        for rect, mode in zip(self._toggle_rects(), ("mix", "channels")):
+            if rect.contains(pos):
+                if self.mode != mode:
+                    self.mode = mode
+                    if self.on_mode_change:
+                        self.on_mode_change()
+                    self.update()
+                return
         _, _, buttons = self._layout()
         for ch, b in buttons.items():
-            if b.contains(event.position()):
+            if b.contains(pos):
                 if ch == "M":
                     state = not all(self.engine.mute)
                     self.engine.set_channel_mute(0, state)
@@ -601,150 +805,28 @@ class ChannelLanes(QWidget):
                     self.on_mute_change()
                 self.update()
                 return
+        self._orbit = (pos, self.yaw, self.pitch)
 
-    @staticmethod
-    def _blit(p, img, rect):
-        img = np.ascontiguousarray(img)
-        h, w = img.shape[:2]
-        qimg = QImage(img.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
-        p.drawImage(QPointF(rect.left(), rect.top()), qimg)
-
-    @staticmethod
-    def _draw_marks(p, marks, lane):
-        """marks: [(y, text)] -- skip any that would collide with one already drawn."""
-        p.setFont(QFont("Consolas", 7))
-        drawn = []
-        for y, text in marks:
-            if y < lane.top() + 4 or y > lane.bottom() - 2 or any(abs(y - d) < 10 for d in drawn):
-                continue
-            drawn.append(y)
-            p.setPen(QPen(TEXT_DIM, 1))
-            p.drawLine(QPointF(lane.left(), y), QPointF(lane.left() + 4, y))
-            p.drawText(QPointF(lane.left() + 7, y + 3), text)
-
-    def paint_header(self, p, r):
-        pass
-
-    def paint_lane(self, p, ch, lane):
-        raise NotImplementedError
-
-    def paint_ruler(self, p, lane, ruler):
-        raise NotImplementedError
-
-
-class WaveformLanes(ChannelLanes):
-    """Rolling 10 s min/max waveform per channel, newest on the right, with a
-    dB ruler (-3/-6/-12/-18 mirrored around -inf) and a seconds timeline on top."""
-
-    TOP = 16
-
-    def __init__(self, engine, on_mute_change=None):
-        super().__init__(engine, on_mute_change)
-        self.wmin = np.zeros((WAVE_HISTORY, 2), dtype=np.float32)
-        self.wmax = np.zeros((WAVE_HISTORY, 2), dtype=np.float32)
-
-    def update_data(self, wmin, wmax, mono):
-        self.wmin, self.wmax, self.mono = wmin, wmax, mono
+    def mouseMoveEvent(self, event):
+        if self._orbit is None:
+            return
+        start, yaw, pitch = self._orbit
+        delta = event.position() - start
+        self.yaw = yaw + delta.x() * 0.3
+        self.pitch = float(np.clip(pitch - delta.y() * 0.3, 0.0, 85.0))
         self.update()
 
-    def paint_header(self, p, r):
-        p.setFont(QFont("Consolas", 7))
-        for sec in range(int(TIMELINE_SECONDS) + 1):
-            x = r.right() - sec / TIMELINE_SECONDS * r.width()
-            p.setPen(QPen(TEXT_DIM, 1))
-            p.drawLine(QPointF(x, r.top() - 4), QPointF(x, r.top()))
-            label = "now" if sec == 0 else f"-{sec}s"
-            p.drawText(QRectF(x - 20, 0, 40, r.top() - 4), Qt.AlignCenter, label)
+    def mouseReleaseEvent(self, event):
+        self._orbit = None
 
-    def paint_lane(self, p, ch, lane):
-        w, h = int(lane.width()), int(lane.height())
-        if w < 2 or h < 4:
-            return
-        half = (h - 1) / 2.0
-        # grid: dB levels + one vertical per second
-        p.setPen(QPen(GRID_COLOR_DIM, 1))
-        for db in WAVE_DB_MARKS:
-            amp = 10 ** (db / 20.0)
-            for sign in (1, -1):
-                y = lane.top() + half - sign * amp * half
-                p.drawLine(QPointF(lane.left(), y), QPointF(lane.right(), y))
-        for sec in range(1, int(TIMELINE_SECONDS)):
-            x = lane.right() - sec / TIMELINE_SECONDS * lane.width()
-            p.drawLine(QPointF(x, lane.top()), QPointF(x, lane.bottom()))
-
-        n = len(self.wmin)
-        starts = np.arange(w) * n // w
-        mins = np.minimum.reduceat(self.wmin[:, ch], starts)
-        maxs = np.maximum.reduceat(self.wmax[:, ch], starts)
-        y_top = np.floor(half - np.clip(maxs, -1, 1) * half)
-        y_bot = np.ceil(half - np.clip(mins, -1, 1) * half)
-        rows = np.arange(h, dtype=np.float32)[:, None]
-        lit = (rows >= y_top[None, :]) & (rows <= y_bot[None, :])
-
-        color = MONO_COLOR if self.mono else CH_COLORS[ch]
-        img = np.zeros((h, w, 4), dtype=np.uint8)
-        img[lit] = (color.red(), color.green(), color.blue(), 235)
-        self._blit(p, img, lane)
-
-        p.setPen(QPen(QColor(255, 255, 255, 50), 1))
-        p.drawLine(QPointF(lane.left(), lane.top() + half), QPointF(lane.right(), lane.top() + half))
-
-    def paint_ruler(self, p, lane, ruler):
-        half = (lane.height() - 1) / 2.0
-        center = lane.top() + half
-        marks = [(center, "-inf")]
-        for db in WAVE_DB_MARKS[::-1]:  # quietest first: near-center labels win collisions
-            amp = 10 ** (db / 20.0)
-            marks += [(center - amp * half, str(db)), (center + amp * half, str(db))]
-        p.setFont(QFont("Consolas", 7))
-        p.setPen(TEXT_DIM)
-        p.drawText(QPointF(ruler.left() + 7, ruler.top() + 9), "dB")
-        self._draw_marks(p, marks, QRectF(ruler.left(), ruler.top() + 10, ruler.width(), ruler.height() - 10))
-
-
-class SpectrogramLanes(ChannelLanes):
-    """Rolling 10 s spectral 'heat' display per channel (time -> X, frequency
-    -> Y on an Audition-like Hz ruler, energy -> color). Columns fade smoothly
-    to black over the last few seconds before they leave the window."""
-
-    def __init__(self, engine, on_mute_change=None):
-        super().__init__(engine, on_mute_change)
-        self.spec = np.full((SPEC_HISTORY, 2, SPEC_ROWS), -200.0, dtype=np.float32)
-
-    def update_data(self, spec, mono):
-        self.spec, self.mono = spec, mono
+    def mouseDoubleClickEvent(self, event):
+        self.yaw, self.pitch, self.zoom = SCOPE_DEFAULT_VIEW
         self.update()
 
-    def paint_lane(self, p, ch, lane):
-        w, h = int(lane.width()), int(lane.height())
-        if w < 2 or h < 2:
-            return
-        cols = np.arange(w) * len(self.spec) // w
-        rows = (h - 1 - np.arange(h)) * SPEC_ROWS // h  # top row = highest frequency
-        db = self.spec[cols, ch, :][:, rows].T  # (h, w)
-        level = np.clip((db - SPEC_DB_FLOOR) / (SPEC_DB_CEIL - SPEC_DB_FLOOR), 0.0, 1.0)
-        rgb = HEAT_LUT[(level * 255).astype(np.int32)].astype(np.float32)  # (h, w, 3)
-
-        age = (1.0 - (np.arange(w) + 0.5) / w) * TIMELINE_SECONDS  # seconds, oldest on the left
-        f = np.clip((TIMELINE_SECONDS - age) / HEAT_FADE_SECONDS, 0.0, 1.0)
-        fade = f * f * (3 - 2 * f)  # smoothstep
-        rgb *= fade[None, :, None]
-
-        img = np.empty((h, w, 4), dtype=np.uint8)
-        img[..., :3] = rgb.astype(np.uint8)
-        img[..., 3] = 255
-        self._blit(p, img, lane)
-
-    def paint_ruler(self, p, lane, ruler):
-        lo, hi = spec_scale(SPEC_FREQ_LO), spec_scale(SPEC_FREQ_HI)
-        marks = []
-        for f in SPEC_HZ_MARKS[::-1]:  # top-down, so 10k wins over 7k when cramped
-            y = lane.bottom() - (spec_scale(f) - lo) / (hi - lo) * lane.height()
-            marks.append((y, f"{f // 1000}k" if f >= 1000 else str(f)))
-        p.setFont(QFont("Consolas", 7))
-        p.setPen(TEXT_DIM)
-        p.drawText(QPointF(ruler.left() + 7, ruler.top() + 9), "Hz")
-        self._draw_marks(p, marks, QRectF(ruler.left(), ruler.top() + 10, ruler.width(), ruler.height() - 10))
+    def wheelEvent(self, event):
+        self.zoom = float(np.clip(self.zoom * 1.1 ** (event.angleDelta().y() / 120.0), 0.4, 4.0))
+        self.update()
+        event.accept()
 
 
 PANEL_STYLE = """
@@ -1106,15 +1188,14 @@ class RadioRecorder(QWidget):
         self.eq_widget = ParametricEQ(self.engine, on_change=self._save_settings, band_list=self.band_list,
                                       on_hum_change=self.hum_panel.sync_from_engine)
         self.eq_widget.refresh()
-        self.wave_lanes = WaveformLanes(self.engine, on_mute_change=self._on_mute_change)
-        self.spec_lanes = SpectrogramLanes(self.engine, on_mute_change=self._on_mute_change)
+        self.scope = Scope3D(self.engine, mode=self.settings.get("scope_mode", "mix"),
+                             on_mute_change=self._on_mute_change, on_mode_change=self._save_settings)
 
-        # EQ view + the two scrolling monitors share what used to be the EQ area
+        # EQ view + the 3D scope share what used to be the EQ area
         monitors = QVBoxLayout()
         monitors.setSpacing(4)
         monitors.addWidget(self.eq_widget, stretch=5)
-        monitors.addWidget(self.wave_lanes, stretch=3)
-        monitors.addWidget(self.spec_lanes, stretch=4)
+        monitors.addWidget(self.scope, stretch=7)
         eq_row.addLayout(monitors, stretch=1)
 
         side = QWidget()
@@ -1266,8 +1347,7 @@ class RadioRecorder(QWidget):
         self._save_settings()
 
     def _on_mute_change(self):
-        self.wave_lanes.update()
-        self.spec_lanes.update()
+        self.scope.update()
         self._save_settings()
 
     def _save_settings(self):
@@ -1278,6 +1358,7 @@ class RadioRecorder(QWidget):
         self.settings["eq_bands"] = self.engine.eq.get_state()
         self.settings["dehummer"] = self.engine.dehummer.get_state()
         self.settings["mute"] = list(self.engine.mute)
+        self.settings["scope_mode"] = self.scope.mode
         self.settings["master_volume"] = self.volume_fader.value()
         settings_store.save(self.settings)
 
@@ -1333,9 +1414,7 @@ class RadioRecorder(QWidget):
         db_l, db_r, _waveform, spectrum_l, spectrum_r = self.engine.snapshot()
         self.eq_widget.update_data(max(db_l, db_r), spectrum_l, spectrum_r)
         self.vu.set_levels(db_l, db_r)
-        wmin, wmax, spec, mono = self.engine.timeline_snapshot()
-        self.wave_lanes.update_data(wmin, wmax, mono)
-        self.spec_lanes.update_data(spec, mono)
+        self.scope.update_data(*self.engine.scope_snapshot())
         if self.engine.last_error:
             self.status_label.setText(f"ERROR: {self.engine.last_error}")
 

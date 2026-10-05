@@ -3,8 +3,8 @@
 
 Pipeline: loopback capture device -> DeHummer -> 5-band EQ -> per-channel mute
 -> (a) monitor output device (so you hear it live) and (b) WAV file while
-recording is active. A 10 s rolling timeline (waveform min/max + spectrogram
-columns) is kept for the scrolling monitors.
+recording is active. A 10 s history of waveform + spectrum frames (L, R and
+mix) feeds the 3D scope.
 """
 import threading
 import time
@@ -28,17 +28,18 @@ SPECTRUM_FREQ_MAX = 18000.0
 SPECTRUM_FREQS = np.logspace(np.log10(SPECTRUM_FREQ_MIN), np.log10(SPECTRUM_FREQ_MAX), SPECTRUM_BINS)
 SPECTRUM_RANGE_DB = 50.0  # dynamic range window shown behind the auto-tracked ceiling
 
-# ---- scrolling timeline monitors --------------------------------------------
+# ---- 3D scope history ---------------------------------------------------------
 TIMELINE_SECONDS = 10.0
-WAVE_CHUNK = 256  # samples per waveform min/max column (~5.3 ms)
-WAVE_HISTORY = int(TIMELINE_SECONDS * SAMPLE_RATE / WAVE_CHUNK)
-SPEC_FFT = 2048  # hop = one capture block
-SPEC_HISTORY = int(np.ceil(TIMELINE_SECONDS * SAMPLE_RATE / BLOCK_SIZE))
-SPEC_ROWS = 160
-SPEC_FREQ_LO, SPEC_FREQ_HI = 40.0, 22000.0
-SPEC_SCALE_OFFSET = 300.0  # log10(f + offset): Audition-like spectral ruler (1k sits ~1/3 up)
+SCOPE_POINTS = 160  # envelope points per history frame
+SCOPE_FRAME_BLOCKS = 10  # one history frame every 10 blocks (~0.21 s)
+SCOPE_WINDOW = SCOPE_FRAME_BLOCKS * BLOCK_SIZE  # samples one frame / the live trace covers
+SCOPE_FRAMES = int(np.ceil(TIMELINE_SECONDS * SAMPLE_RATE / BLOCK_SIZE / SCOPE_FRAME_BLOCKS))
+SPEC_FFT = 2048  # analysis window = the last two capture blocks
+SPEC_ROWS = 128
+SPEC_FREQ_LO, SPEC_FREQ_HI = 40.0, 20000.0
+SPEC_SCALE_OFFSET = 0.0  # plain log frequency axis
 SPEC_SILENCE_DB = -200.0
-MONO_HOLD_BLOCKS = 47  # ~1 s of identical L/R (non-silent) before showing a single lane
+MONO_HOLD_BLOCKS = 47  # ~1 s of identical L/R (non-silent) before showing a single view
 
 
 def spec_scale(freq):
@@ -52,6 +53,15 @@ def spec_unscale(value):
 SPEC_ROW_EDGES = spec_unscale(np.linspace(spec_scale(SPEC_FREQ_LO), spec_scale(SPEC_FREQ_HI), SPEC_ROWS + 1))
 SPEC_ROW_BINS = np.clip(np.round(SPEC_ROW_EDGES[:-1] * SPEC_FFT / SAMPLE_RATE).astype(int), 0, SPEC_FFT // 2)
 SPEC_WINDOW = np.hanning(SPEC_FFT)[:, None]
+
+
+def peak_decimate(x, points):
+    """(n, c) -> (points, c), keeping the largest-magnitude sample of each
+    segment (with its sign) so peaks survive the downsampling."""
+    k = len(x) // points
+    seg = x[len(x) - points * k:].reshape(points, k, x.shape[1])
+    idx = np.abs(seg).argmax(axis=1)[:, None, :]
+    return np.take_along_axis(seg, idx, axis=1)[:, 0, :]
 
 
 def list_capture_devices():
@@ -99,12 +109,13 @@ class AudioEngine:
         self._spectrum_r = np.zeros(len(self.spectrum_freqs), dtype=np.float32)
         self._spec_ceiling = -20.0
 
-        self._wave_min = np.zeros((WAVE_HISTORY, 2), dtype=np.float32)
-        self._wave_max = np.zeros((WAVE_HISTORY, 2), dtype=np.float32)
-        self._wave_pos = 0
-        self._spec_hist = np.full((SPEC_HISTORY, 2, SPEC_ROWS), SPEC_SILENCE_DB, dtype=np.float32)
-        self._spec_pos = 0
         self._fft_buf = np.zeros((0, 2), dtype=np.float32)
+        self._live = np.zeros((SCOPE_WINDOW, 2), dtype=np.float32)
+        self._block_count = 0
+        self._scope_wave = np.zeros((SCOPE_FRAMES, 3, 2, SCOPE_POINTS), dtype=np.float32)
+        self._scope_spec = np.full((SCOPE_FRAMES, 3, SPEC_ROWS), SPEC_SILENCE_DB, dtype=np.float32)
+        self._scope_block = np.full(SCOPE_FRAMES, -10 ** 9, dtype=np.int64)
+        self._scope_pos = 0
         self._stereo_hold = MONO_HOLD_BLOCKS
         self._is_mono = False
         self._state_lock = threading.Lock()
@@ -204,15 +215,16 @@ class AudioEngine:
             return (self._level_db_l, self._level_db_r, self._waveform.copy(),
                     self._spectrum_l.copy(), self._spectrum_r.copy())
 
-    def timeline_snapshot(self):
-        """Oldest -> newest: waveform min/max (WAVE_HISTORY, 2), spectrogram dB
-        (SPEC_HISTORY, 2, SPEC_ROWS), and whether the input currently looks mono.
-        Pre-mute data, so a channel's history is there the moment it's unmuted."""
+    def scope_snapshot(self):
+        """Live trace (last SCOPE_WINDOW samples, (n, 2)), then history frames
+        oldest -> newest: waveform envelopes (F, 3, [max, min], SCOPE_POINTS) and spectra in dB (F, 3,
+        SPEC_ROWS) for [L, R, mix], each frame's age in seconds, and whether
+        the input looks mono. Pre-mute, so a channel shows the moment it's unmuted."""
         with self._state_lock:
-            wp = self._wave_pos % WAVE_HISTORY
-            sp = self._spec_pos % SPEC_HISTORY
-            return (np.roll(self._wave_min, -wp, axis=0), np.roll(self._wave_max, -wp, axis=0),
-                    np.roll(self._spec_hist, -sp, axis=0), self._is_mono)
+            order = (np.arange(SCOPE_FRAMES) + self._scope_pos) % SCOPE_FRAMES
+            ages = (self._block_count - self._scope_block[order]) * BLOCK_SIZE / SAMPLE_RATE
+            return (self._live.copy(), self._scope_wave[order], self._scope_spec[order],
+                    ages, self._is_mono)
 
     @property
     def last_error(self):
@@ -283,20 +295,12 @@ class AudioEngine:
             self._running.clear()
 
     def _update_timeline(self, block):
+        buf = np.concatenate([self._fft_buf, block])[-SPEC_FFT:]
+        self._fft_buf = buf
+        live = np.concatenate([self._live, block])[-SCOPE_WINDOW:]
+        self._block_count += 1
+
         n = len(block)
-        nchunks = n // WAVE_CHUNK
-        seg = block[:nchunks * WAVE_CHUNK].reshape(nchunks, WAVE_CHUNK, 2)
-        mins = seg.min(axis=1)
-        maxs = seg.max(axis=1)
-
-        self._fft_buf = np.concatenate([self._fft_buf, block])[-SPEC_FFT:]
-        spec = None
-        if len(self._fft_buf) == SPEC_FFT:
-            # scaled so a full-scale sine reads ~0 dBFS
-            mags = np.abs(np.fft.rfft(self._fft_buf * SPEC_WINDOW, axis=0)) / (SPEC_FFT / 4)
-            rows = np.maximum.reduceat(mags, SPEC_ROW_BINS, axis=0)  # (ROWS, 2)
-            spec = (20 * np.log10(rows + 1e-10)).T.astype(np.float32)
-
         peak = float(np.abs(block).max()) if n else 0.0
         if peak > 1e-5:  # silence says nothing about mono vs stereo
             diff = float(np.abs(block[:, 0] - block[:, 1]).max())
@@ -305,15 +309,24 @@ class AudioEngine:
             elif self._stereo_hold > 0:
                 self._stereo_hold -= 1
 
+        frame = None
+        if len(buf) == SPEC_FFT and self._block_count % SCOPE_FRAME_BLOCKS == 0:
+            three = np.column_stack([buf, buf.mean(axis=1)])  # L, R, mix
+            # scaled so a full-scale sine reads ~0 dBFS
+            mags = np.abs(np.fft.rfft(three * SPEC_WINDOW, axis=0)) / (SPEC_FFT / 4)
+            rows = np.maximum.reduceat(mags, SPEC_ROW_BINS, axis=0)  # (ROWS, 3)
+            win = np.column_stack([live, live.mean(axis=1)])
+            seg = win.reshape(SCOPE_POINTS, -1, 3)
+            envelope = np.stack([seg.max(axis=1).T, seg.min(axis=1).T], axis=1)  # (3, 2, P)
+            frame = (envelope, (20 * np.log10(rows + 1e-10)).T)
+
         with self._state_lock:
-            if nchunks:
-                idx = (self._wave_pos + np.arange(nchunks)) % WAVE_HISTORY
-                self._wave_min[idx] = mins
-                self._wave_max[idx] = maxs
-                self._wave_pos += nchunks
-            if spec is not None:
-                self._spec_hist[self._spec_pos % SPEC_HISTORY] = spec
-                self._spec_pos += 1
+            self._live = live
+            if frame is not None:
+                i = self._scope_pos % SCOPE_FRAMES
+                self._scope_wave[i], self._scope_spec[i] = frame
+                self._scope_block[i] = self._block_count
+                self._scope_pos += 1
             self._is_mono = self._stereo_hold == 0
 
     def _resolve_output_index(self, name):
