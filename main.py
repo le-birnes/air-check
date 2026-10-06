@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from engine import (
     AudioEngine, list_capture_devices, list_monitor_devices, peak_decimate, TIMELINE_SECONDS,
     SCOPE_FRAMES, SCOPE_POINTS, SCOPE_WINDOW, SPEC_ROWS, SPEC_FREQ_LO, SPEC_FREQ_HI,
+    SCOPE_FRAME_BLOCKS, BLOCK_SIZE, SAMPLE_RATE,
 )
 from eq import (
     BAND_DEFS, DEHUMMER_PRESETS, HUM_FREQ_MIN, HUM_FREQ_MAX, HUM_Q_MIN,
@@ -166,17 +167,18 @@ SCOPE_TEXT = QColor(170, 170, 215, 170)
 SCOPE_AXIS = QColor(200, 200, 230, 80)
 SCOPE_BTN = QColor(140, 160, 255)
 SCOPE_FADE_SECONDS = 3.0  # history fades out over the last 3 s of the 10 s window
+SCOPE_SLICE_SECONDS = 0.3  # history frames are averaged into slices this long (each one leaves an imprint)
+SCOPE_SLICE_BLOCKS = max(SCOPE_FRAME_BLOCKS, int(round(SCOPE_SLICE_SECONDS * SAMPLE_RATE / BLOCK_SIZE
+                                                       / SCOPE_FRAME_BLOCKS)) * SCOPE_FRAME_BLOCKS)
 SCOPE_DEPTH = 1.5         # world units the 10 s history spans on each side of the live trace
 SCOPE_Y = 1.6             # half-length of the Y axis (the live trace / frequency axis)
 SCOPE_WAVE_Z = 0.55       # waveform full-scale height
 SCOPE_SPEC_Z = 0.8        # spectrum full height
 SCOPE_EQ_Z = 0.6          # EQ curve on the YZ plane: +-DB_RANGE maps to +-SCOPE_EQ_Z
 SCOPE_DB_FLOOR, SCOPE_DB_CEIL = -90.0, -10.0
-SCOPE_ALPHA_BUCKETS = 10
 SCOPE_HZ_MARKS = (50, 100, 200, 500, 1000, 2000, 5000, 10000)
 SCOPE_DEFAULT_VIEW = (16.0, 52.0, 1.0)  # yaw deg, pitch deg, zoom
 SCOPE_PITCH_MAX = 90.0    # orbit can tilt the floor all the way to a top-down view
-SCOPE_LACE_STEP = 1       # spectrum rows that also run across time (1 = full terrain mesh)
 EQ_RGB = (255, 205, 60)
 EQ_NODE_HALF_W, EQ_NODE_HALF_H = 17, 11  # node tag half-size, px (gain line + Q line)
 EQ_HIT_RADIUS = 16
@@ -185,8 +187,6 @@ WAVE_RGB_NEW, WAVE_RGB_OLD = np.array([125, 175, 255]), np.array([150, 90, 255])
 # spectrum heat map: level 0..1 -> deep blue, purple, red, orange, hot yellow
 HEAT_STOPS = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
 HEAT_RGB = np.array([[25, 30, 140], [125, 35, 205], [235, 40, 70], [255, 150, 30], [255, 245, 150]])
-HEAT_BINS = 12
-HEAT_FADE_BINS = 4
 LIVE_RGB = (215, 230, 255)
 
 _PATH_DTYPE = np.dtype([("c", ">i4"), ("x", ">f8"), ("y", ">f8")])
@@ -215,8 +215,9 @@ def _smoothstep(f):
 
 class Scope3D(QWidget):
     """3D audio scope. Y axis: the live waveform. X+: the last 10 s of waveform
-    frames receding behind it (topography). X-: the matching spectrum frames
-    (spectral map, log Hz along Y) coming forward, laced into a terrain.
+    receding behind it. X-: the matching spectrum (log Hz along Y) coming
+    forward. History is averaged into 0.3 s slices, and each slice leaves an
+    imprint joined to the next, so both sides read as solids, not meshes.
     Everything fades out smoothly at 10 s.
 
     MIX/CH toggle: one scene for the mix, or L | R side by side. Channel mute
@@ -247,8 +248,25 @@ class Scope3D(QWidget):
         self._orbit = None
         self.setMinimumHeight(220)
 
-    def update_data(self, live, wave, spec, ages, mono):
-        self.live, self.wave, self.spec, self.ages, self.mono = live, wave, spec, ages, mono
+    def update_data(self, live, wave, spec, ages, mono, blocks):
+        """History frames are averaged into SCOPE_SLICE_SECONDS slices: fewer,
+        calmer imprints to draw. Slices are keyed on the capture block, so a
+        slice keeps the same frames as it scrolls back (only the newest one grows)."""
+        self.live, self.mono = live, mono
+        valid = ages < TIMELINE_SECONDS
+        if not valid.any():
+            self.wave, self.spec, self.ages = wave[:0], spec[:0], ages[:0]
+        else:
+            key = blocks[valid] // SCOPE_SLICE_BLOCKS
+            _, inv = np.unique(key, return_inverse=True)
+            n = np.bincount(inv).astype(np.float32)
+
+            def mean(a):
+                out = np.zeros((len(n),) + a.shape[1:], dtype=np.float32)
+                np.add.at(out, inv, a)
+                return out / n.reshape((-1,) + (1,) * (a.ndim - 1))
+
+            self.wave, self.spec, self.ages = mean(wave[valid]), mean(spec[valid]), mean(ages[valid])
         self.update()
 
     # ---- layout -----------------------------------------------------------------
@@ -340,16 +358,13 @@ class Scope3D(QWidget):
         valid = ages < TIMELINE_SECONDS
         fade = (_smoothstep((TIMELINE_SECONDS - ages) / SCOPE_FADE_SECONDS)
                 * (1.0 - 0.45 * np.clip(ages / TIMELINE_SECONDS, 0, 1)))
-        # X+: waveform topography -- each frame's max/min envelope as one
-        # closed silhouette, receding behind the live trace
+        # X+ waveform / X- spectrum history as solids; the far side goes first
         if valid.any():
-            ys = np.linspace(-SCOPE_Y, SCOPE_Y, SCOPE_POINTS)
-            ys = np.concatenate([ys, ys[::-1]])
-            env = np.clip(self.wave[valid, idx], -1, 1)  # (k, 2, P)
-            zs = np.concatenate([env[:, 0], env[:, 1, ::-1]], axis=1) * SCOPE_WAVE_Z
-            xs = (ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + 0.02)[:, None] * np.ones_like(ys)
-            sx, sy = proj(xs, np.broadcast_to(ys, xs.shape), zs)
-            self._stroke_buckets(p, sx, sy, fade[valid], ages[valid], WAVE_RGB_NEW, WAVE_RGB_OLD)
+            sides = [self._paint_wave_solid, self._paint_spec_solid]
+            if np.cos(np.radians(self.yaw)) < 0:  # orbited round: X- is the far side
+                sides.reverse()
+            for paint in sides:
+                paint(p, proj, idx, valid, ages[valid], fade[valid])
 
         # live trace on the Y axis: the same window a history frame covers
         three = np.column_stack([self.live, self.live.mean(axis=1)])
@@ -361,16 +376,6 @@ class Scope3D(QWidget):
         for width, alpha in ((4.0, 45), (1.2, 230)):
             p.setPen(QPen(QColor(*LIVE_RGB, alpha), width))
             p.drawPath(path)
-        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
-
-        # X-: spectral map coming forward, laced into a terrain
-        if valid.any():
-            ry = np.linspace(-SCOPE_Y, SCOPE_Y, SPEC_ROWS)
-            level = np.clip((self.spec[valid, idx, :] - SCOPE_DB_FLOOR) / (SCOPE_DB_CEIL - SCOPE_DB_FLOOR), 0, 1) ** 1.6
-            xs = -(ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + 0.04)[:, None] * np.ones_like(ry)
-            sx, sy = proj(xs, np.broadcast_to(ry, xs.shape), level * SCOPE_SPEC_Z)
-            self._stroke_heat(p, sx, sy, level, fade[valid])
-
         p.setCompositionMode(QPainter.CompositionMode_SourceOver)
         self._paint_eq(p, proj)
         p.setFont(QFont("Consolas", 8, QFont.Bold))
@@ -477,55 +482,91 @@ class Scope3D(QWidget):
             self.on_eq_commit()
         self.update()
 
-    @staticmethod
-    def _stroke_heat(p, sx, sy, level, fade):
-        """Spectrum terrain as a mesh of segments -- along frequency (each
-        frame) and across time (every SCOPE_LACE_STEP row) -- each colored by
-        its level on the heat scale. Segments are grouped into
-        heat x fade buckets so the whole mesh is a few dozen drawPath calls."""
-        fade = np.broadcast_to(fade[:, None], level.shape)
-        parts = [(sx[:, :-1], sx[:, 1:], sy[:, :-1], sy[:, 1:],
-                  (level[:, :-1] + level[:, 1:]) / 2, fade[:, 1:])]
-        if len(level) > 1:
-            lace = slice(0, None, SCOPE_LACE_STEP)
-            parts.append((sx[:-1, lace], sx[1:, lace], sy[:-1, lace], sy[1:, lace],
-                          (level[:-1, lace] + level[1:, lace]) / 2, fade[:-1, lace]))
-        x0, x1, y0, y1, lv, fd = (np.concatenate([part[i].ravel() for part in parts]) for i in range(6))
-        keep = fd > 0.01
-        x0, x1, y0, y1, lv, fd = x0[keep], x1[keep], y0[keep], y1[keep], lv[keep], fd[keep]
-        if not len(lv):
-            return
-        hb = np.minimum((lv * HEAT_BINS).astype(int), HEAT_BINS - 1)
-        fb = np.minimum((fd * HEAT_FADE_BINS).astype(int), HEAT_FADE_BINS - 1)
-        key = hb * HEAT_FADE_BINS + fb
-        order = np.argsort(key, kind="stable")
-        keys, starts = np.unique(key[order], return_index=True)
-        ends = np.append(starts[1:], len(order))
-        # the mesh is dense enough to hide jaggies; antialiasing it costs ~5 ms per frame
-        p.setRenderHint(QPainter.Antialiasing, False)
-        for k, a, b in zip(keys, starts, ends):
-            sel = order[a:b]
-            h = (k // HEAT_FADE_BINS + 0.5) / HEAT_BINS
-            f = (k % HEAT_FADE_BINS + 0.5) / HEAT_FADE_BINS
-            rgb = [int(np.interp(h, HEAT_STOPS, HEAT_RGB[:, c])) for c in range(3)]
-            p.setPen(QPen(QColor(*rgb, int(255 * f * (0.35 + 0.65 * h))), 1.0))
-            p.drawPath(polylines_path(np.column_stack([x0[sel], x1[sel]]),
-                                      np.column_stack([y0[sel], y1[sel]])))
-        p.setRenderHint(QPainter.Antialiasing, True)
+    def _paint_wave_solid(self, p, proj, idx, valid, ages, fade):
+        """X+: each frame's max/min envelope as a filled silhouette receding
+        behind the live trace; stacked back to front they form a solid,
+        dark at the zero line and bright at the peaks."""
+        ys = np.linspace(-SCOPE_Y, SCOPE_Y, SCOPE_POINTS)
+        env = np.clip(self.wave[valid, idx], -1, 1) * SCOPE_WAVE_Z  # (k, 2, P)
+        x = ages / TIMELINE_SECONDS * SCOPE_DEPTH + 0.02
+        xs, yy = x[:, None] * np.ones_like(ys), np.broadcast_to(ys, (len(x), len(ys)))
+        skins = [proj(xs, yy, env[:, 0]), proj(xs, yy, env[:, 1])]  # max and min surfaces
+        t = np.clip(ages / TIMELINE_SECONDS, 0, 1)[:, None]
+        rgb = WAVE_RGB_NEW * (1 - t) + WAVE_RGB_OLD * t
+        # bright at +-full scale, dark at the zero line
+        stops = [(0.0, rgb * 1.0, 0.95), (0.5, rgb * 0.3, 0.8), (1.0, rgb * 1.0, 0.95)]
+        self._fill_skin(p, proj, x, fade, -SCOPE_WAVE_Z, SCOPE_WAVE_Z, skins, stops,
+                        np.minimum(rgb * 1.3, 255))
 
-    @staticmethod
-    def _stroke_buckets(p, sx, sy, fade, ages, rgb_new, rgb_old):
-        """One path per opacity bucket (not per frame) keeps draw calls few."""
-        bucket = np.minimum((fade * SCOPE_ALPHA_BUCKETS).astype(int), SCOPE_ALPHA_BUCKETS - 1)
-        for b in range(SCOPE_ALPHA_BUCKETS):
-            sel = (bucket == b) & (fade > 0.01)
-            if not sel.any():
+    def _paint_spec_solid(self, p, proj, idx, valid, ages, fade):
+        """X-: the spectrum frames coming forward as one solid terrain,
+        heat-mapped by height."""
+        ry = np.linspace(-SCOPE_Y, SCOPE_Y, SPEC_ROWS)
+        level = np.clip((self.spec[valid, idx, :] - SCOPE_DB_FLOOR) / (SCOPE_DB_CEIL - SCOPE_DB_FLOOR), 0, 1) ** 1.6
+        x = -(ages / TIMELINE_SECONDS * SCOPE_DEPTH + 0.04)
+        skin = proj(x[:, None] * np.ones_like(ry), np.broadcast_to(ry, level.shape), level * SCOPE_SPEC_Z)
+        ones = np.ones((len(x), 1))
+        stops = [(h, HEAT_RGB[j] * ones, 0.6 + 0.4 * h) for j, h in enumerate(HEAT_STOPS)]
+        # each ridge takes the heat color of its slice's loudest band, lifted
+        peak = level.max(axis=1)
+        ridge = np.column_stack([np.interp(peak, HEAT_STOPS, HEAT_RGB[:, c]) for c in range(3)])
+        self._fill_skin(p, proj, x, fade, 0.0, SCOPE_SPEC_Z, [skin], stops, np.minimum(ridge * 1.25, 255))
+
+    def _fill_skin(self, p, proj, x, fade, z0, z1, skins, stops, ridge_rgb):
+        """Every history slice leaves an imprint: the strip between it and the
+        next older slice is filled, so the slices join into a solid surface
+        instead of a mesh. Strips go farthest first so nearer ones occlude.
+        skins: [(sx, sy)] each (k, n) -- one profile per slice per surface.
+        stops: [(pos, (k, 3) rgb, alpha 0..1)] along world Z, z0 -> z1;
+        each slice's profile also gets a ridge line in ridge_rgb (k, 3)."""
+        if len(x) < 2:
+            return
+        by_age = np.argsort(np.abs(x))
+        older = np.empty_like(by_age)
+        older[by_age[:-1]] = by_age[1:]
+        older[by_age[-1]] = -1
+        k = len(x)
+        (ax, bx), (ay, by) = (np.asarray(v) for v in proj(np.stack([x, x]), np.zeros((2, k)),
+                                                         np.array([[z0], [z1]]) * np.ones(k)))
+        (ux0, ux1), (uy0, uy1) = (np.asarray(v) for v in proj(np.stack([x, x]),
+                                                             np.array([[-SCOPE_Y], [SCOPE_Y]]) * np.ones(k),
+                                                             np.full((2, k), z0)))
+        # run the gradient perpendicular to the slice's Y on screen, so its
+        # color depends on height only, not on where along Y a point sits
+        ux, uy = ux1 - ux0, uy1 - uy0
+        ul = np.maximum(np.hypot(ux, uy), 1e-9)
+        nx, ny = -uy / ul, ux / ul
+        reach = (bx - ax) * nx + (by - ay) * ny
+        reach = np.where(np.abs(reach) < 1.0, -1.0, reach)  # edge-on: keep the gradient defined
+        bx, by = ax + nx * reach, ay + ny * reach
+
+        def brush(i):
+            g = QLinearGradient(float(ax[i]), float(ay[i]), float(bx[i]), float(by[i]))
+            for s, rgb, a in stops:
+                r, gg, b = (int(c) for c in rgb[i])
+                g.setColorAt(float(s), QColor(r, gg, b, int(255 * a * fade[i])))
+            return QBrush(g)
+
+        # strips are dense enough to hide jaggies; antialiasing them is the expensive part
+        p.setRenderHint(QPainter.Antialiasing, False)
+        cos_yaw = np.cos(np.radians(self.yaw))
+        for i in np.argsort(-x * cos_yaw):
+            j = older[i]
+            if fade[i] <= 0.01:
                 continue
-            t = float(np.clip(ages[sel].mean() / TIMELINE_SECONDS, 0, 1))
-            r, g, bl = (rgb_new * (1 - t) + rgb_old * t).astype(int)
-            alpha = (b + 0.5) / SCOPE_ALPHA_BUCKETS
-            p.setPen(QPen(QColor(r, g, bl, int(200 * alpha)), 1.0))
-            p.drawPath(polylines_path(sx[sel], sy[sel]))
+            # a flat-colored ridge: a gradient pen costs as much as the fill
+            r, g, b = (int(c) for c in ridge_rgb[i])
+            fill, ridge = brush(i), QPen(QColor(r, g, b, int(220 * fade[i])), 1.0)
+            for sx, sy in skins:
+                if j >= 0:
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(fill)
+                    p.drawPath(polylines_path(np.concatenate([sx[i], sx[j, ::-1]])[None, :],
+                                              np.concatenate([sy[i], sy[j, ::-1]])[None, :]))
+                p.setBrush(Qt.NoBrush)
+                p.setPen(ridge)
+                p.drawPath(polylines_path(sx[i:i + 1], sy[i:i + 1]))
+        p.setRenderHint(QPainter.Antialiasing, True)
 
     def _paint_axes(self, p, proj):
         d, wz, yl = SCOPE_DEPTH, SCOPE_WAVE_Z, SCOPE_Y

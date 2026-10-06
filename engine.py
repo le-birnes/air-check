@@ -218,13 +218,15 @@ class AudioEngine:
     def scope_snapshot(self):
         """Live trace (last SCOPE_WINDOW samples, (n, 2)), then history frames
         oldest -> newest: waveform envelopes (F, 3, [max, min], SCOPE_POINTS) and spectra in dB (F, 3,
-        SPEC_ROWS) for [L, R, mix], each frame's age in seconds, and whether
-        the input looks mono. Pre-mute, so a channel shows the moment it's unmuted."""
+        SPEC_ROWS) for [L, R, mix], each frame's age in seconds, whether the
+        input looks mono, and each frame's capture block number (a stable
+        stamp for grouping frames). Pre-mute, so a channel shows the moment it's unmuted."""
         with self._state_lock:
             order = (np.arange(SCOPE_FRAMES) + self._scope_pos) % SCOPE_FRAMES
-            ages = (self._block_count - self._scope_block[order]) * BLOCK_SIZE / SAMPLE_RATE
+            blocks = self._scope_block[order].copy()
+            ages = (self._block_count - blocks) * BLOCK_SIZE / SAMPLE_RATE
             return (self._live.copy(), self._scope_wave[order], self._scope_spec[order],
-                    ages, self._is_mono)
+                    ages, self._is_mono, blocks)
 
     @property
     def last_error(self):
