@@ -24,7 +24,8 @@ from PySide6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).parent))
 from engine import (
     AudioEngine, list_capture_devices, list_monitor_devices, peak_decimate, TIMELINE_SECONDS,
-    SCOPE_FRAMES, SCOPE_POINTS, SCOPE_WINDOW, SPEC_ROWS, SPEC_FREQ_LO, SPEC_FREQ_HI,
+    SCOPE_POINTS, SCOPE_WINDOW, SPEC_ROWS, SPEC_FREQ_LO, SPEC_FREQ_HI,
+    SCOPE_HOPS, SCOPE_HOP_DEFAULT, SAMPLE_RATE,
 )
 from eq import (
     BAND_DEFS, DEHUMMER_PRESETS, HUM_FREQ_MIN, HUM_FREQ_MAX, HUM_Q_MIN,
@@ -183,7 +184,11 @@ EQ_HIT_RADIUS = 16
 SCOPE_CAMERA = 5.0
 # terrain color by height, bottom -> top: near-black, purple, red, yellow, near-white (never pure black/white)
 TERRAIN_STOPS = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
-TERRAIN_RGB = np.array([[14, 6, 24], [105, 35, 185], [225, 40, 60], [255, 205, 45], [250, 245, 225]])
+TERRAIN_RGB = np.array([[8, 4, 14], [58, 18, 108], [150, 24, 46], [205, 135, 24], [232, 222, 188]])
+TERRAIN_GAMMA = 1.6        # > 1 keeps most of the terrain in the dark end; only real peaks get bright
+TERRAIN_STEP_SECONDS = 0.05  # terrain shape: one (averaged, softened) row per 50 ms; colors stay full-rate
+# waveform history: shades of blue, deep navy -> icy near-white
+WAVE_TERRAIN_RGB = np.array([[4, 6, 20], [12, 28, 84], [28, 68, 158], [78, 138, 218], [188, 212, 244]])
 TERRAIN_BINS = 24          # discrete height colors
 LIVE_RGB = (215, 230, 255)
 
@@ -206,17 +211,49 @@ def polylines_path(xs, ys):
     return path
 
 
+def terrain_rows(values, first_index, step):
+    """Coarse terrain rows from a full-rate history: the frames averaged in
+    groups of `step`, the groups aligned to the absolute frame index (so a
+    group keeps its frames as the history scrolls and the hills don't jitter),
+    then softened along time with two [1, 2, 1] passes. -> (frame positions
+    (r,), heights (r, n)); the first and last frame are always rows, so the
+    surface spans the whole history."""
+    k = len(values)
+    starts = np.flatnonzero((first_index + np.arange(k)) % step == 0)
+    if not len(starts) or starts[0] != 0:
+        starts = np.concatenate([[0], starts])
+    counts = np.diff(np.append(starts, k))
+    means = np.add.reduceat(values, starts, axis=0) / counts[:, None]
+    for _ in range(2):
+        padded = np.concatenate([means[:1], means, means[-1:]])
+        means = (padded[:-2] + 2 * padded[1:-1] + padded[2:]) / 4
+    pos = starts + (counts - 1) / 2.0
+    pos = np.concatenate([[0.0], pos, [k - 1.0]])
+    means = np.concatenate([means[:1], means, means[-1:]])
+    return pos.astype(np.float32), means.astype(np.float32)
+
+
 _TERRAIN_VS = """
 #version 330
-layout(location = 0) in vec3 pos;
-layout(location = 1) in float height;
+layout(location = 0) in float shape;  // height value (time-averaged): the slow topography
+layout(location = 1) in float fpos;   // this row's position in history frames (0 = oldest)
 uniform vec2 yaw;      // cos, sin
 uniform vec2 pitch;    // cos, sin
 uniform vec3 cam;      // scale, cx, cy (logical px)
 uniform vec2 size;     // widget size (logical px)
 uniform float camera;  // SCOPE_CAMERA
-out float v_height;
+uniform int cols;      // values per frame (along Y)
+uniform vec3 grid;     // x of frame 0, x step per frame, Y half-length
+uniform int mode;      // 0 waveform peak, 1 spectrum dB
+uniform vec4 zmap;     // mode 0: (z scale); mode 1: (dB floor, dB ceil, z scale)
+out vec2 v_cell;       // (history frame, Y column) for the fragment's color lookup
+float to_z(float v) {
+    return mode == 0 ? clamp(v, -1.0, 1.0) * zmap.x
+                     : pow(clamp((v - zmap.x) / (zmap.y - zmap.x), 0.0, 1.0), 1.6) * zmap.z;
+}
 void main() {
+    int col = gl_VertexID % cols;
+    vec3 pos = vec3(grid.x + grid.y * fpos, grid.z * (2.0 * float(col) / float(cols - 1) - 1.0), to_z(shape));
     // exactly Scope3D._project, so the QPainter overlays line up
     float depth = pos.x * yaw.x - pos.y * yaw.y;
     float right = pos.x * yaw.y + pos.y * yaw.x;
@@ -226,19 +263,33 @@ void main() {
     float sx = cam.y + cam.x * right * f;
     float sy = cam.z - cam.x * up * f;
     gl_Position = vec4(2.0 * sx / size.x - 1.0, 1.0 - 2.0 * sy / size.y, -toward / camera, 1.0);
-    v_height = height;
+    v_cell = vec2(fpos, float(col));
 }
 """
 
 _TERRAIN_FS = """
 #version 330
-in float v_height;
+in vec2 v_cell;
+uniform sampler2D values;  // full-rate raw history: width = Y columns, height = frames
+uniform int mode;
+uniform vec4 zmap;
+uniform vec2 zrange;       // z bottom, top -> palette
 uniform vec3 palette[5];
 uniform float bins;
+uniform float gamma;
 out vec4 color;
+float to_z(float v) {
+    return mode == 0 ? clamp(v, -1.0, 1.0) * zmap.x
+                     : pow(clamp((v - zmap.x) / (zmap.y - zmap.x), 0.0, 1.0), 1.6) * zmap.z;
+}
 void main() {
+    // real-time coloring: every pixel reads its own frame, however coarse the shape is
+    ivec2 size = textureSize(values, 0);
+    ivec2 texel = clamp(ivec2(int(v_cell.y + 0.5), int(v_cell.x + 0.5)), ivec2(0), size - 1);
+    float height = (to_z(texelFetch(values, texel, 0).r) - zrange.x) / (zrange.y - zrange.x);
     // discrete height bands along the palette, never its pure ends
-    float q = (floor(clamp(v_height, 0.0, 0.9999) * bins) + 0.5) / bins * 4.0;
+    float h = pow(clamp(height, 0.0, 0.9999), gamma);
+    float q = (floor(h * bins) + 0.5) / bins * 4.0;
     int i = int(min(floor(q), 3.0));
     color = vec4(mix(palette[i], palette[i + 1], q - float(i)), 1.0);
 }
@@ -246,10 +297,12 @@ void main() {
 
 
 class TerrainGL:
-    """GPU half of Scope3D: a (frames, Y) height grid drawn as one
-    depth-tested triangle mesh, so nearer terrain hides farther terrain per
-    pixel and the history reads as one continuous fabric. Lives in the
-    widget's GL context; call only from paintGL (inside native painting)."""
+    """GPU half of Scope3D. Two rates on one surface: the shape is a coarse
+    mesh (one row per TERRAIN_STEP_SECONDS of history, averaged and softened,
+    so it rolls into hills and valleys); the color comes from the full-rate
+    raw history, uploaded as a texture and read per pixel. Depth-tested, so
+    nearer terrain hides farther terrain per pixel. Lives in the widget's GL
+    context; call only from paintGL (inside native painting)."""
 
     def __init__(self):
         self.vao = GL.glGenVertexArrays(1)
@@ -261,14 +314,21 @@ class TerrainGL:
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
         GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ibo)
         GL.glEnableVertexAttribArray(0)
-        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, False, 16, ctypes.c_void_p(0))
+        GL.glVertexAttribPointer(0, 1, GL.GL_FLOAT, False, 8, ctypes.c_void_p(0))
         GL.glEnableVertexAttribArray(1)
-        GL.glVertexAttribPointer(1, 1, GL.GL_FLOAT, False, 16, ctypes.c_void_p(12))
+        GL.glVertexAttribPointer(1, 1, GL.GL_FLOAT, False, 8, ctypes.c_void_p(4))
         GL.glBindVertexArray(0)
+        self.tex = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
+        for p in (GL.GL_TEXTURE_MIN_FILTER, GL.GL_TEXTURE_MAG_FILTER):
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, p, GL.GL_NEAREST)
+        for p in (GL.GL_TEXTURE_WRAP_S, GL.GL_TEXTURE_WRAP_T):
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, p, GL.GL_CLAMP_TO_EDGE)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         self.loc = {name: GL.glGetUniformLocation(self.program, name)
-                    for name in ("yaw", "pitch", "cam", "size", "camera", "palette", "bins")}
-        self._grid = None  # (k, n) the index buffer was built for
-        self._count = 0
+                    for name in ("yaw", "pitch", "cam", "size", "camera", "palette", "bins", "gamma",
+                                 "cols", "grid", "mode", "zmap", "zrange", "values")}
+        self._grid = None  # (rows, n) the index buffer was built for
 
     def begin(self, view, scissor, viewport):
         """view: yaw deg, pitch deg, (scale, cx, cy), (w, h) logical px.
@@ -289,36 +349,54 @@ class TerrainGL:
         GL.glUniform3f(self.loc["cam"], *cam)
         GL.glUniform2f(self.loc["size"], *size)
         GL.glUniform1f(self.loc["camera"], SCOPE_CAMERA)
-        GL.glUniform3fv(self.loc["palette"], 5, (TERRAIN_RGB / 255.0).astype(np.float32))
         GL.glUniform1f(self.loc["bins"], TERRAIN_BINS)
+        GL.glUniform1f(self.loc["gamma"], TERRAIN_GAMMA)
+        GL.glUniform1i(self.loc["values"], 0)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)
         GL.glBindVertexArray(self.vao)
 
-    def draw(self, x, ys, z, z_range):
-        """x: (k,) frame positions, ys: (n,), z: (k, n) heights; z_range
-        (bottom, top) maps onto the palette."""
-        k, n = z.shape
+    def draw(self, values, first_index, step, x0, dx, mode, zmap, z_range, palette):
+        """values: (k, n) raw history, frames oldest -> newest and evenly
+        spaced, frame r at x0 + r * dx; first_index: absolute index of frame 0;
+        step: frames per terrain row. mode 0: waveform peaks, z = value * zmap[0];
+        mode 1: spectrum dB, zmap = (floor, ceil, z scale). z_range (bottom,
+        top) maps onto palette ((5, 3) RGB 0..255)."""
+        k, n = values.shape
         if k < 2:
             return
-        lo, hi = z_range
-        verts = np.empty((k, n, 4), dtype=np.float32)
-        verts[..., 0] = x[:, None]
-        verts[..., 1] = ys[None, :]
-        verts[..., 2] = z
-        verts[..., 3] = (z - lo) / (hi - lo)
+        values = np.ascontiguousarray(values, dtype=np.float32)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_R32F, n, k, 0, GL.GL_RED, GL.GL_FLOAT, values)
+        pos, shapes = terrain_rows(values, first_index, step)
+        r = len(pos)
+        GL.glUniform3fv(self.loc["palette"], 5, (palette / 255.0).astype(np.float32))
+        GL.glUniform1i(self.loc["cols"], n)
+        GL.glUniform3f(self.loc["grid"], x0, dx, SCOPE_Y)
+        GL.glUniform1i(self.loc["mode"], mode)
+        GL.glUniform4f(self.loc["zmap"], *(list(zmap) + [0.0] * (4 - len(zmap))))
+        GL.glUniform2f(self.loc["zrange"], *z_range)
+        data = np.empty((r, n, 2), dtype=np.float32)  # interleaved (shape, row position)
+        data[..., 0] = shapes
+        data[..., 1] = pos[:, None]
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, verts.nbytes, verts, GL.GL_STREAM_DRAW)
-        if self._grid != (k, n):
-            # two triangles per cell between frame rows r and r + 1 (rows are in age order)
-            v = np.arange(k * n, dtype=np.uint32).reshape(k, n)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, data.nbytes, data, GL.GL_STREAM_DRAW)
+        rows, cols = self._grid or (0, 0)
+        if cols != n or rows < r:
+            # two triangles per cell between rows j and j + 1. Built for the most rows
+            # seen: fewer rows use a prefix of it, so it isn't rebuilt every paint.
+            rows = max(r, rows if cols == n else 0)
+            v = np.arange(rows * n, dtype=np.uint32).reshape(rows, n)
             a, b, c, d = v[:-1, :-1], v[:-1, 1:], v[1:, 1:], v[1:, :-1]
             idx = np.stack([a, b, c, a, c, d], axis=-1).ravel()
             GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, GL.GL_STATIC_DRAW)
-            self._grid, self._count = (k, n), len(idx)
-        GL.glDrawElements(GL.GL_TRIANGLES, self._count, GL.GL_UNSIGNED_INT, ctypes.c_void_p(0))
+            self._grid = (rows, n)
+        GL.glDrawElements(GL.GL_TRIANGLES, (r - 1) * (n - 1) * 6, GL.GL_UNSIGNED_INT, ctypes.c_void_p(0))
 
     @staticmethod
     def end():
         GL.glBindVertexArray(0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         GL.glUseProgram(0)
         GL.glDisable(GL.GL_DEPTH_TEST)
         GL.glDisable(GL.GL_SCISSOR_TEST)
@@ -328,11 +406,12 @@ class Scope3D(QOpenGLWidget):
     """3D audio scope. Y axis: the live waveform. X+: the last 10 s of waveform
     (max envelope) receding behind it. X-: the matching spectrum (log Hz along
     Y) coming forward. Both are opaque terrains drawn on the GPU with a depth
-    buffer, one frame every ~43 ms so clicks show, colored by height from
-    near-black (bottom) to near-white (top). Axes, live trace and EQ are
-    QPainter overlays on top.
+    buffer, colored in height bands: blues for the waveform, near-black to
+    near-white heat for the spectrum. Axes, live trace and EQ are QPainter
+    overlays on top.
 
-    MIX/CH toggle: one scene for the mix, or L | R side by side. Channel mute
+    MIX/CH toggle: one scene for the mix, or L | R side by side. The rate
+    label next to it cycles the history frame hop (1 ms .. 43 ms). Channel mute
     buttons on the right: a muted channel's scene disappears and the other
     takes the whole area; both muted = dark. Mono input = one scene.
     The 5-band EQ curve stands on the YZ plane (log Hz along Y, gain along Z):
@@ -353,9 +432,9 @@ class Scope3D(QOpenGLWidget):
         self._eq_freqs = np.logspace(np.log10(SPEC_FREQ_LO), np.log10(SPEC_FREQ_HI), 300)
         self.mono = False
         self.live = np.zeros((SCOPE_WINDOW, 2), dtype=np.float32)
-        self.wave = np.zeros((SCOPE_FRAMES, 3, 2, SCOPE_POINTS), dtype=np.float32)
-        self.spec = np.full((SCOPE_FRAMES, 3, SPEC_ROWS), -200.0, dtype=np.float32)
-        self.ages = np.full(SCOPE_FRAMES, 1e9)
+        self.wave, self.spec = {}, {}  # channel -> (F, SCOPE_POINTS) max envelope / (F, SPEC_ROWS) dB
+        self.ages = np.zeros(0)
+        self.first_index = 0  # absolute index of the first history frame
         self.yaw, self.pitch, self.zoom = SCOPE_DEFAULT_VIEW
         self._orbit = None
         self._gl = None  # TerrainGL, created with the GL context
@@ -368,14 +447,24 @@ class Scope3D(QOpenGLWidget):
     def initializeGL(self):
         self._gl = TerrainGL()
 
-    def update_data(self, live, wave, spec, ages, mono):
-        self.live, self.wave, self.spec, self.ages, self.mono = live, wave, spec, ages, mono
+    def update_data(self, live, wave, spec, ages, mono, channels, first_index):
+        self.live, self.ages, self.mono, self.first_index = live, ages, mono, first_index
+        self.wave = {c: wave[:, i] for i, c in enumerate(channels)}
+        self.spec = {c: spec[:, i] for i, c in enumerate(channels)}
         self.update()
+
+    def channels_needed(self):
+        """Data channels the current scenes draw (0 L, 1 R, 2 mix)."""
+        return tuple(idx for _, idx, _ in self._layout()[1]) or (2,)
 
     # ---- layout -----------------------------------------------------------------
     @staticmethod
     def _toggle_rects():
         return QRectF(6, 4, 34, 15), QRectF(40, 4, 34, 15)
+
+    @staticmethod
+    def _rate_rect():
+        return QRectF(80, 4, 44, 15)
 
     def _layout(self):
         """-> (area, [(label, data index, rect)], {button: rect})"""
@@ -459,7 +548,7 @@ class Scope3D(QOpenGLWidget):
 
         # X+ waveform / X- spectrum history as opaque GPU terrains (depth-tested, so no draw order)
         valid = self.ages < TIMELINE_SECONDS
-        if self._gl is not None and valid.sum() > 1:
+        if self._gl is not None and valid.sum() > 1 and idx in self.wave:
             p.beginNativePainting()
             self._gl.begin((self.yaw, self.pitch, cam, (self.width(), self.height())),
                            self._device_rect(rect), self._device_rect(QRectF(self.rect())))
@@ -590,20 +679,32 @@ class Scope3D(QOpenGLWidget):
         return (int(rect.left() * dpr), int((self.height() - rect.bottom()) * dpr),
                 int(rect.width() * dpr), int(rect.height() * dpr))
 
+    def _terrain_layout(self, valid):
+        """(absolute index of the first drawn frame, frames per terrain row):
+        the shape is drawn at TERRAIN_STEP_SECONDS whatever the history rate."""
+        step = max(1, int(round(TERRAIN_STEP_SECONDS * SAMPLE_RATE / self.engine.scope_hop)))
+        return self.first_index + int(np.argmax(valid)), step
+
+    def _frame_x(self, valid, sign, offset):
+        """First frame's X and the step between frames: frames are evenly
+        spaced (one per hop), so X is linear in the frame index."""
+        x = sign * (self.ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + offset)
+        return float(x[0]), float((x[-1] - x[0]) / (len(x) - 1))
+
     def _wave_terrain(self, idx, valid):
         """X+: the waveform's max envelope receding behind the live trace. Only
         the top surface: whatever lies under it is hidden anyway."""
-        ys = np.linspace(-SCOPE_Y, SCOPE_Y, SCOPE_POINTS)
-        z = np.clip(self.wave[valid, idx, 0], -1, 1) * SCOPE_WAVE_Z
-        x = self.ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + 0.02
-        return x, ys, z, (0.0, SCOPE_WAVE_Z)
+        x0, dx = self._frame_x(valid, 1, 0.02)
+        return (self.wave[idx][valid], *self._terrain_layout(valid), x0, dx, 0, (SCOPE_WAVE_Z,),
+                (0.0, SCOPE_WAVE_Z), WAVE_TERRAIN_RGB)
 
     def _spec_terrain(self, idx, valid):
         """X-: the spectrum (log Hz along Y) coming forward."""
-        ry = np.linspace(-SCOPE_Y, SCOPE_Y, SPEC_ROWS)
-        level = np.clip((self.spec[valid, idx, :] - SCOPE_DB_FLOOR) / (SCOPE_DB_CEIL - SCOPE_DB_FLOOR), 0, 1) ** 1.6
-        x = -(self.ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + 0.04)
-        return x, ry, level * SCOPE_SPEC_Z, (0.0, SCOPE_SPEC_Z)
+        x0, dx = self._frame_x(valid, -1, 0.04)
+        # clamped at the display floor first, so silence (-200 dB) doesn't drag the averaged heights down
+        values = np.maximum(self.spec[idx][valid], SCOPE_DB_FLOOR)
+        return (values, *self._terrain_layout(valid), x0, dx, 1, (SCOPE_DB_FLOOR, SCOPE_DB_CEIL, SCOPE_SPEC_Z),
+                (0.0, SCOPE_SPEC_Z), TERRAIN_RGB)
 
     def _paint_axes(self, p, proj):
         d, wz, yl = SCOPE_DEPTH, SCOPE_WAVE_Z, SCOPE_Y
@@ -662,10 +763,24 @@ class Scope3D(QOpenGLWidget):
             p.drawRect(rect)
             p.setPen(QColor(235, 235, 255) if on else QColor(110, 100, 140))
             p.drawText(rect, Qt.AlignCenter, label)
+        rect = self._rate_rect()  # history frame hop: click cycles
+        p.setPen(QPen(QColor(70, 60, 90), 1))
+        p.setBrush(QColor(12, 10, 20))
+        p.drawRect(rect)
+        p.setPen(QColor(235, 235, 255))
+        p.drawText(rect, Qt.AlignCenter, f"{self.engine.scope_hop * 1000 / SAMPLE_RATE:.0f} ms")
 
     # ---- mouse ------------------------------------------------------------------
     def mousePressEvent(self, event):
         pos = event.position()
+        if self._rate_rect().contains(pos):
+            hops = list(SCOPE_HOPS)
+            cur = self.engine.scope_hop
+            self.engine.set_scope_hop(hops[(hops.index(cur) + 1) % len(hops)] if cur in hops else SCOPE_HOP_DEFAULT)
+            if self.on_mode_change:
+                self.on_mode_change()
+            self.update()
+            return
         for rect, mode in zip(self._toggle_rects(), ("mix", "channels")):
             if rect.contains(pos):
                 if self.mode != mode:
@@ -1110,6 +1225,7 @@ class RadioRecorder(QWidget):
         self.hum_panel = DeHummerPanel(self.engine.dehummer, self.settings["dehummer_presets"],
                                        on_change=self._save_settings)
         self.band_list.refresh(self.engine.eq.bands)
+        self.engine.set_scope_hop(self.settings.get("scope_hop", SCOPE_HOP_DEFAULT))
         self.scope = Scope3D(self.engine, mode=self.settings.get("scope_mode", "mix"),
                              on_mute_change=self._on_mute_change, on_mode_change=self._save_settings,
                              on_eq_change=lambda: self.band_list.refresh(self.engine.eq.bands),
@@ -1282,6 +1398,7 @@ class RadioRecorder(QWidget):
         self.settings["dehummer"] = self.engine.dehummer.get_state()
         self.settings["mute"] = list(self.engine.mute)
         self.settings["scope_mode"] = self.scope.mode
+        self.settings["scope_hop"] = self.engine.scope_hop
         self.settings["master_volume"] = self.volume_fader.value()
         settings_store.save(self.settings)
 
@@ -1336,7 +1453,7 @@ class RadioRecorder(QWidget):
     def _tick(self):
         db_l, db_r = self.engine.snapshot()[:2]
         self.vu.set_levels(db_l, db_r)
-        self.scope.update_data(*self.engine.scope_snapshot())
+        self.scope.update_data(*self.engine.scope_snapshot(self.scope.channels_needed()))
         if self.engine.last_error:
             self.status_label.setText(f"ERROR: {self.engine.last_error}")
 

@@ -31,10 +31,11 @@ SPECTRUM_RANGE_DB = 50.0  # dynamic range window shown behind the auto-tracked c
 # ---- 3D scope history ---------------------------------------------------------
 TIMELINE_SECONDS = 10.0
 SCOPE_POINTS = 128  # envelope points per history frame (must divide SCOPE_WINDOW)
-SCOPE_FRAME_BLOCKS = 2  # one history frame every 2 blocks (~43 ms): fast enough to catch clicks
-SCOPE_WINDOW = SCOPE_FRAME_BLOCKS * BLOCK_SIZE  # samples one frame / the live trace covers
-SCOPE_FRAMES = int(np.ceil(TIMELINE_SECONDS * SAMPLE_RATE / BLOCK_SIZE / SCOPE_FRAME_BLOCKS))
-SPEC_FFT = 2048  # analysis window = the last two capture blocks
+SCOPE_WINDOW = 2048  # samples one history frame / the live trace covers
+# history frame hops offered on the scope, in samples: 1, 5, 10 ms, one block (~21 ms), two blocks (~43 ms)
+SCOPE_HOPS = (48, 240, 480, BLOCK_SIZE, 2 * BLOCK_SIZE)
+SCOPE_HOP_DEFAULT = 2 * BLOCK_SIZE
+SPEC_FFT = 2048  # analysis window = the 2048 samples ending at each frame
 SPEC_ROWS = 128
 SPEC_FREQ_LO, SPEC_FREQ_HI = 40.0, 20000.0
 SPEC_SCALE_OFFSET = 0.0  # plain log frequency axis
@@ -109,13 +110,10 @@ class AudioEngine:
         self._spectrum_r = np.zeros(len(self.spectrum_freqs), dtype=np.float32)
         self._spec_ceiling = -20.0
 
-        self._fft_buf = np.zeros((0, 2), dtype=np.float32)
+        self._tail = np.zeros((SPEC_FFT, 2), dtype=np.float32)  # last samples, so every frame has a full window
         self._live = np.zeros((SCOPE_WINDOW, 2), dtype=np.float32)
-        self._block_count = 0
-        self._scope_wave = np.zeros((SCOPE_FRAMES, 3, 2, SCOPE_POINTS), dtype=np.float32)
-        self._scope_spec = np.full((SCOPE_FRAMES, 3, SPEC_ROWS), SPEC_SILENCE_DB, dtype=np.float32)
-        self._scope_block = np.full(SCOPE_FRAMES, -10 ** 9, dtype=np.int64)
-        self._scope_pos = 0
+        self._sample_count = 0
+        self._alloc_scope(SCOPE_HOP_DEFAULT)
         self._stereo_hold = MONO_HOLD_BLOCKS
         self._is_mono = False
         self._state_lock = threading.Lock()
@@ -137,6 +135,28 @@ class AudioEngine:
 
     def set_channel_mute(self, channel, muted):
         self.mute[channel] = bool(muted)
+
+    # ---- scope history rate -------------------------------------------------
+    def _alloc_scope(self, hop):
+        """Fresh 10 s history ring for frames every `hop` samples: the max
+        envelope (F, [L, R, mix], SCOPE_POINTS) and spectrum in dB (F, 3, SPEC_ROWS)."""
+        frames = int(np.ceil(TIMELINE_SECONDS * SAMPLE_RATE / hop))
+        self._scope_hop = hop
+        self._scope_wave = np.zeros((frames, 3, SCOPE_POINTS), dtype=np.float32)
+        self._scope_spec = np.full((frames, 3, SPEC_ROWS), SPEC_SILENCE_DB, dtype=np.float32)
+        self._scope_stamp = np.zeros(frames, dtype=np.int64)  # end sample of each frame
+        self._scope_pos = 0
+
+    @property
+    def scope_hop(self):
+        return self._scope_hop
+
+    def set_scope_hop(self, hop):
+        """History frame hop in samples (one of SCOPE_HOPS); restarts the history."""
+        hop = int(hop) if int(hop) in SCOPE_HOPS else SCOPE_HOP_DEFAULT
+        with self._state_lock:
+            if hop != self._scope_hop:
+                self._alloc_scope(hop)
 
     def set_spectrum_bin_count(self, n):
         """Rescale the spectrum resolution (called by the UI as the window is resized)."""
@@ -215,16 +235,23 @@ class AudioEngine:
             return (self._level_db_l, self._level_db_r, self._waveform.copy(),
                     self._spectrum_l.copy(), self._spectrum_r.copy())
 
-    def scope_snapshot(self):
-        """Live trace (last SCOPE_WINDOW samples, (n, 2)), then history frames
-        oldest -> newest: waveform envelopes (F, 3, [max, min], SCOPE_POINTS) and spectra in dB (F, 3,
-        SPEC_ROWS) for [L, R, mix], each frame's age in seconds, and whether
-        the input looks mono. Pre-mute, so a channel shows the moment it's unmuted."""
+    def scope_snapshot(self, channels=(0, 1, 2)):
+        """Live trace (last SCOPE_WINDOW samples, (n, 2)), then the recorded
+        history frames oldest -> newest for the asked channels (0 L, 1 R,
+        2 mix): max envelopes (F, len(channels), SCOPE_POINTS) and spectra in
+        dB (F, len(channels), SPEC_ROWS), each frame's age in seconds, whether
+        the input looks mono, the channels, and the absolute index of the
+        first frame (frames since the history started; stable as it scrolls).
+        Only the asked channels are copied: at a 1 ms hop the full history is tens of MB.
+        Pre-mute, so a channel shows the moment it's unmuted."""
+        ch = np.asarray(channels, dtype=int)
         with self._state_lock:
-            order = (np.arange(SCOPE_FRAMES) + self._scope_pos) % SCOPE_FRAMES
-            ages = (self._block_count - self._scope_block[order]) * BLOCK_SIZE / SAMPLE_RATE
-            return (self._live.copy(), self._scope_wave[order], self._scope_spec[order],
-                    ages, self._is_mono)
+            size = len(self._scope_stamp)
+            filled = min(self._scope_pos, size)
+            order = (np.arange(self._scope_pos - filled, self._scope_pos) % size)[:, None]
+            ages = (self._sample_count - self._scope_stamp[order[:, 0]]) / SAMPLE_RATE
+            return (self._live.copy(), self._scope_wave[order, ch], self._scope_spec[order, ch],
+                    ages, self._is_mono, tuple(channels), self._scope_pos - filled)
 
     @property
     def last_error(self):
@@ -295,12 +322,12 @@ class AudioEngine:
             self._running.clear()
 
     def _update_timeline(self, block):
-        buf = np.concatenate([self._fft_buf, block])[-SPEC_FFT:]
-        self._fft_buf = buf
-        live = np.concatenate([self._live, block])[-SCOPE_WINDOW:]
-        self._block_count += 1
-
+        hist = np.concatenate([self._tail, block])  # (SPEC_FFT + n, 2)
+        self._tail = hist[-SPEC_FFT:]
+        live = hist[-SCOPE_WINDOW:]
         n = len(block)
+        s0 = self._sample_count
+        self._sample_count += n
         peak = float(np.abs(block).max()) if n else 0.0
         if peak > 1e-5:  # silence says nothing about mono vs stereo
             diff = float(np.abs(block[:, 0] - block[:, 1]).max())
@@ -309,24 +336,29 @@ class AudioEngine:
             elif self._stereo_hold > 0:
                 self._stereo_hold -= 1
 
-        frame = None
-        if len(buf) == SPEC_FFT and self._block_count % SCOPE_FRAME_BLOCKS == 0:
-            three = np.column_stack([buf, buf.mean(axis=1)])  # L, R, mix
+        # every frame whose end sample falls in this block, all at once (~21 per block at a 1 ms hop)
+        hop = self._scope_hop
+        ends = np.arange((s0 // hop + 1) * hop, s0 + n + 1, hop)
+        frames = None
+        if len(ends):
+            local = ends - s0 + SPEC_FFT  # end index inside hist
+            win = hist[local[:, None] + np.arange(-SPEC_FFT, 0)]  # (m, SPEC_FFT, 2)
+            three = np.concatenate([win, win.mean(axis=2, keepdims=True)], axis=2)  # L, R, mix
             # scaled so a full-scale sine reads ~0 dBFS
-            mags = np.abs(np.fft.rfft(three * SPEC_WINDOW, axis=0)) / (SPEC_FFT / 4)
-            rows = np.maximum.reduceat(mags, SPEC_ROW_BINS, axis=0)  # (ROWS, 3)
-            win = np.column_stack([live, live.mean(axis=1)])
-            seg = win.reshape(SCOPE_POINTS, -1, 3)
-            envelope = np.stack([seg.max(axis=1).T, seg.min(axis=1).T], axis=1)  # (3, 2, P)
-            frame = (envelope, (20 * np.log10(rows + 1e-10)).T)
+            mags = np.abs(np.fft.rfft(three * SPEC_WINDOW[None], axis=1)) / (SPEC_FFT / 4)
+            rows = np.maximum.reduceat(mags, SPEC_ROW_BINS, axis=1)  # (m, ROWS, 3)
+            seg = three[:, -SCOPE_WINDOW:].reshape(len(ends), SCOPE_POINTS, -1, 3)
+            frames = (seg.max(axis=2).transpose(0, 2, 1),               # (m, 3, P) max envelope
+                      (20 * np.log10(rows + 1e-10)).transpose(0, 2, 1),  # (m, 3, ROWS)
+                      ends)
 
         with self._state_lock:
             self._live = live
-            if frame is not None:
-                i = self._scope_pos % SCOPE_FRAMES
-                self._scope_wave[i], self._scope_spec[i] = frame
-                self._scope_block[i] = self._block_count
-                self._scope_pos += 1
+            if frames is not None and hop == self._scope_hop:  # a rate change meanwhile drops them
+                size = len(self._scope_stamp)
+                i = (self._scope_pos + np.arange(len(ends))) % size
+                self._scope_wave[i], self._scope_spec[i], self._scope_stamp[i] = frames
+                self._scope_pos += len(ends)
             self._is_mono = self._stereo_hold == 0
 
     def _resolve_output_index(self, name):

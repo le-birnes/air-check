@@ -14,6 +14,7 @@ DEFAULTS = {
     "mute": [False, False],
     "auto_power_on": True,
     "master_volume": 100,
+    "scope_hop": 2048,  # scope history frame hop in samples (engine.SCOPE_HOPS)
 }
 
 

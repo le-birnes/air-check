@@ -27,10 +27,16 @@ and have not been tested on Arch yet.
   detected and shown as one scene.
 - **3D scope** (OpenGL, depth-tested):
   - Y axis: the live waveform trace.
-  - X+: the last 10 s of waveform (max envelope) as a terrain receding back.
-  - X-: the last 10 s of spectrum (log frequency along Y) coming forward.
-  - A new history frame every ~43 ms, so short clicks stay visible.
-  - Opaque surfaces colored in height bands, near-black to near-white.
+  - X+: the last 10 s of waveform (max envelope) as a terrain receding back,
+    in shades of blue.
+  - X-: the last 10 s of spectrum (log frequency along Y) coming forward,
+    in dark heat bands (near-black, purple, red, amber, pale cream).
+  - Two rates on one surface: the *shape* is drawn at 50 ms (averaged and
+    softened, so it rolls into hills and valleys), while the *color* is the
+    full-rate history read per pixel, so short clicks still show.
+  - History rate selectable live: 1, 5, 10, 21 (one audio block) or 43 ms
+    per frame.
+  - Opaque, depth-tested surfaces; nothing below the top surface is drawn.
   - MIX view or L | R side by side.
 - **System tray** app: closing the window keeps it running (and recording);
   quit from the tray menu. `--start-hidden` starts it in the tray.
@@ -48,6 +54,7 @@ and have not been tested on Arch yet.
 | elsewhere        | mouse wheel   | zoom                      |
 | elsewhere        | double-click  | reset the view            |
 | MIX / CH toggle  | click         | one mix scene or L \| R   |
+| rate label (ms)  | click         | cycle the history rate    |
 | L / R buttons    | click         | mute a channel            |
 
 ## Requirements
@@ -162,3 +169,10 @@ graphic EQ's band ordering (node drags jumping to unrelated bands).
   continuous surface instead of slices drawn back to front, at about 3 ms of
   CPU per frame. Frames come every ~43 ms with no averaging, so clicks show.
   The open-folder button became cross-platform, and this README was added.
+- The history rate became a live setting (1 to 43 ms). The engine computes
+  several frames per audio block, and the GPU works out geometry and color
+  from the raw values. The waveform got its own blue palette, and both
+  palettes got darker.
+- Two-rate terrain: a coarse 50 ms mesh carries the shape (rolling hills),
+  and a full-rate texture carries the color. A 1 ms history draws in about
+  13 ms.
