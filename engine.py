@@ -30,8 +30,8 @@ SPECTRUM_RANGE_DB = 50.0  # dynamic range window shown behind the auto-tracked c
 
 # ---- 3D scope history ---------------------------------------------------------
 TIMELINE_SECONDS = 10.0
-SCOPE_POINTS = 160  # envelope points per history frame
-SCOPE_FRAME_BLOCKS = 10  # one history frame every 10 blocks (~0.21 s)
+SCOPE_POINTS = 128  # envelope points per history frame (must divide SCOPE_WINDOW)
+SCOPE_FRAME_BLOCKS = 4  # one history frame every 4 blocks (~85 ms): dense enough to read as terrain
 SCOPE_WINDOW = SCOPE_FRAME_BLOCKS * BLOCK_SIZE  # samples one frame / the live trace covers
 SCOPE_FRAMES = int(np.ceil(TIMELINE_SECONDS * SAMPLE_RATE / BLOCK_SIZE / SCOPE_FRAME_BLOCKS))
 SPEC_FFT = 2048  # analysis window = the last two capture blocks

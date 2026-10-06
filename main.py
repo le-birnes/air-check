@@ -37,8 +37,6 @@ BG_BOTTOM = QColor(0, 0, 0)
 PANEL_BORDER = QColor(255, 25, 25)
 GRID_COLOR = QColor(255, 25, 25, 55)
 GRID_COLOR_DIM = QColor(120, 20, 20, 60)
-CURVE_COLOR = QColor(255, 70, 70)
-CURVE_GLOW = QColor(255, 70, 70, 60)
 ZERO_LINE = QColor(255, 255, 255, 90)
 TEXT_DIM = QColor(200, 70, 70, 180)
 TEXT_BRIGHT = QColor(255, 190, 190)
@@ -75,11 +73,6 @@ def db_to_y(db, rect):
     return rect.bottom() - frac * rect.height()
 
 
-def y_to_db(y, rect):
-    frac = (rect.bottom() - y) / rect.height()
-    return frac * 2 * DB_RANGE - DB_RANGE
-
-
 def x_to_freq(x, rect):
     lo, hi = np.log10(FREQ_MIN), np.log10(FREQ_MAX)
     frac = min(max((x - rect.left()) / rect.width(), 0.0), 1.0)
@@ -98,35 +91,27 @@ Q_WHEEL_STEP = 1.15  # Q multiplier per mouse-wheel notch
 
 
 class ParametricEQ(QWidget):
-    """Live spectrum behind the 5-band EQ curve (left +-15 dB scale), plus the
-    DeHummer notch comb in red on its own 0..-80 dB right-hand scale.
-    Drag a node = move it, mouse wheel over a node = narrower/wider (Q),
-    double-click = reset that band."""
+    """Live spectrum (left +-15 dB scale) plus the DeHummer notch comb in red
+    on its own 0..-80 dB right-hand scale. The 5-band EQ nodes live on the 3D
+    scope's YZ plane. Drag the hum node = move it, mouse wheel = Q."""
 
     HIT_RADIUS = 14
 
-    def __init__(self, engine, on_change=None, band_list=None, on_hum_change=None):
+    def __init__(self, engine, on_change=None, on_hum_change=None):
         super().__init__()
         self.engine = engine
         self.on_change = on_change
         self.on_hum_change = on_hum_change
-        self.band_list = band_list
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(160)
 
         self.spectrum_freqs = np.logspace(np.log10(FREQ_MIN), np.log10(FREQ_MAX), SPECTRUM_BIN_COUNT)
         engine.set_spectrum_bin_count(SPECTRUM_BIN_COUNT)
         self.spectrum_l = np.zeros(SPECTRUM_BIN_COUNT)
         self.spectrum_r = np.zeros(SPECTRUM_BIN_COUNT)
         self.level_db = -60.0
-        self._dragging = None  # band index, or HUM_NODE
-        self.curve_freqs = np.logspace(np.log10(FREQ_MIN), np.log10(FREQ_MAX), 400)
+        self._dragging = False  # dragging the hum node
         self.hum_freqs = np.logspace(np.log10(FREQ_MIN), np.log10(FREQ_MAX), 900)
         self.setMouseTracking(True)
-
-    def refresh(self):
-        if self.band_list is not None:
-            self.band_list.refresh(self.engine.eq.bands)
-        self.update()
 
     def update_data(self, level_db, spectrum_l, spectrum_r):
         self.level_db = level_db
@@ -153,10 +138,8 @@ class ParametricEQ(QWidget):
         p.save()
         p.setClipRect(rect.adjusted(-1, -1, 1, 1))
         self._draw_hum(p, rect)
-        self._draw_curve(p, rect)
         p.restore()
         self._draw_hum_axis(p, rect)
-        self._draw_nodes(p, rect)
         p.end()
 
     def _draw_grid(self, p, rect):
@@ -228,11 +211,6 @@ class ParametricEQ(QWidget):
         p.setPen(QPen(ZERO_LINE, 1, Qt.DotLine))
         p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
 
-    def _draw_curve(self, p, rect):
-        db_vals = np.clip(self.engine.eq.response_db(self.curve_freqs), -DB_RANGE, DB_RANGE)
-        self._stroke(p, self._path(self.curve_freqs, [db_to_y(d, rect) for d in db_vals], rect),
-                     CURVE_COLOR)
-
     @staticmethod
     def _path(freqs, ys, rect):
         path = QPainterPath()
@@ -298,118 +276,42 @@ class ParametricEQ(QWidget):
         p.drawText(QRectF(x - 60, y + 6, 120, 13), Qt.AlignCenter,
                    f"{fmt_freq(hum.freq)}Hz Q{hum.q:.0f} {hum.gain_db:.0f}dB")
 
-    def _band_pos(self, band, rect):
-        gain = band.gain_db if band.kind == "peak" else 0.0
-        return freq_to_x(band.freq, rect), db_to_y(gain, rect)
-
-    def _draw_nodes(self, p, rect):
-        half = 9  # node square half-size
-        for i, band in enumerate(self.engine.eq.bands):
-            x, y = self._band_pos(band, rect)
-            color = QColor(NODE_COLORS[i % len(NODE_COLORS)])
-            off = band.is_off() and band.kind != "peak"
-            if off:
-                color.setAlpha(110)
-            square = QRectF(x - half, y - half, half * 2, half * 2)
-
-            p.setPen(QPen(QColor(20, 0, 0), 1.5))
-            p.setBrush(color)
-            p.drawRect(square)
-
-            # gain (bells) or HP/LP tag sits inside the square itself
-            p.setFont(QFont("Consolas", 7, QFont.Bold))
-            p.setPen(QColor(15, 0, 0))
-            inner = f"{band.gain_db:+.0f}" if band.kind == "peak" else band.name
-            p.drawText(square, Qt.AlignCenter, inner)
-
-            # frequency floats above, Q (narrowness) below
-            p.setFont(QFont("Consolas", 9, QFont.Bold))
-            label = "OFF" if off else f"{fmt_freq(band.freq)}Hz"
-            label_rect = QRectF(x - 30, y - half - 17, 60, 14)
-            p.setPen(QColor(10, 0, 0, 210))
-            p.drawText(label_rect.translated(0, 1), Qt.AlignCenter, label)
-            p.setPen(TEXT_BRIGHT)
-            p.drawText(label_rect, Qt.AlignCenter, label)
-            if not off:
-                p.setFont(QFont("Consolas", 7))
-                p.setPen(TEXT_DIM)
-                p.drawText(QRectF(x - 30, y + half + 1, 60, 11), Qt.AlignCenter, f"Q{band.q:.2f}")
-
-    # ---- mouse interaction ---------------------------------------------------
-    def _hit(self, pos, rect):
-        r2 = self.HIT_RADIUS ** 2
-        if self.engine.dehummer.enabled:
-            x, y = self._hum_node_pos(rect)
-            if (pos.x() - x) ** 2 + (pos.y() - y) ** 2 <= r2:
-                return HUM_NODE
-        best, best_d = None, None
-        for i, band in enumerate(self.engine.eq.bands):
-            x, y = self._band_pos(band, rect)
-            d = (pos.x() - x) ** 2 + (pos.y() - y) ** 2
-            if d <= r2 and (best_d is None or d < best_d):
-                best, best_d = i, d
-        return best
+    # ---- mouse interaction (hum node only) -------------------------------------
+    def _hit_hum(self, pos, rect):
+        if not self.engine.dehummer.enabled:
+            return False
+        x, y = self._hum_node_pos(rect)
+        return (pos.x() - x) ** 2 + (pos.y() - y) ** 2 <= self.HIT_RADIUS ** 2
 
     def mousePressEvent(self, event):
-        self._dragging = self._hit(event.position(), self.plot_rect())
-
-    def mouseDoubleClickEvent(self, event):
-        idx = self._hit(event.position(), self.plot_rect())
-        if idx is None or idx == HUM_NODE:
-            return
-        self.engine.eq.reset_band(idx)
-        self.refresh()
-        if self.on_change:
-            self.on_change()
+        self._dragging = self._hit_hum(event.position(), self.plot_rect())
 
     def mouseMoveEvent(self, event):
-        if self._dragging is None:
+        if not self._dragging:
             return
         rect = self.plot_rect()
         pos = event.position()
-        freq = x_to_freq(pos.x(), rect)
-        if self._dragging == HUM_NODE:
-            self.engine.dehummer.set_params(freq=freq, gain_db=self._hum_db(pos.y(), rect))
-            if self.on_hum_change:
-                self.on_hum_change()
-            self.update()
-            return
-        band = self.engine.eq.bands[self._dragging]
-        if band.kind == "peak":
-            band.set_params(freq=freq, gain_db=y_to_db(pos.y(), rect))
-        else:
-            band.set_params(freq=freq)
-        self.refresh()
+        self.engine.dehummer.set_params(freq=x_to_freq(pos.x(), rect), gain_db=self._hum_db(pos.y(), rect))
+        if self.on_hum_change:
+            self.on_hum_change()
+        self.update()
 
     def mouseReleaseEvent(self, event):
-        if self._dragging is not None and self.on_change:
+        if self._dragging and self.on_change:
             self.on_change()
-        self._dragging = None
+        self._dragging = False
 
     def wheelEvent(self, event):
-        target = self._hit(event.position(), self.plot_rect())
-        if target is None:
+        if not self._hit_hum(event.position(), self.plot_rect()):
             return
-        factor = Q_WHEEL_STEP ** (event.angleDelta().y() / 120.0)
-        if target == HUM_NODE:
-            hum = self.engine.dehummer
-            hum.set_params(q=hum.q * factor)
-            if self.on_hum_change:
-                self.on_hum_change()
-            self.update()
-        else:
-            band = self.engine.eq.bands[target]
-            band.set_params(q=band.q * factor)
-            self.refresh()
+        hum = self.engine.dehummer
+        hum.set_params(q=hum.q * Q_WHEEL_STEP ** (event.angleDelta().y() / 120.0))
+        if self.on_hum_change:
+            self.on_hum_change()
+        self.update()
         if self.on_change:
             self.on_change()
         event.accept()
-
-    def reset_flat(self):
-        self.engine.eq.reset_flat()
-        self.refresh()
-        if self.on_change:
-            self.on_change()
 
 
 class VuStrip(QWidget):
@@ -518,10 +420,16 @@ SCOPE_DEPTH = 1.5         # world units the 10 s history spans on each side of t
 SCOPE_Y = 1.6             # half-length of the Y axis (the live trace / frequency axis)
 SCOPE_WAVE_Z = 0.55       # waveform full-scale height
 SCOPE_SPEC_Z = 0.8        # spectrum full height
+SCOPE_EQ_Z = 0.6          # EQ curve on the YZ plane: +-DB_RANGE maps to +-SCOPE_EQ_Z
 SCOPE_DB_FLOOR, SCOPE_DB_CEIL = -90.0, -10.0
 SCOPE_ALPHA_BUCKETS = 10
 SCOPE_HZ_MARKS = (50, 100, 200, 500, 1000, 2000, 5000, 10000)
-SCOPE_DEFAULT_VIEW = (16.0, 30.0, 1.0)  # yaw deg, pitch deg, zoom
+SCOPE_DEFAULT_VIEW = (16.0, 52.0, 1.0)  # yaw deg, pitch deg, zoom
+SCOPE_PITCH_MAX = 90.0    # orbit can tilt the floor all the way to a top-down view
+SCOPE_LACE_STEP = 4       # every 4th spectrum row also runs across time (terrain grid)
+EQ_RGB = (255, 205, 60)
+EQ_NODE_HALF = 7          # node square half-size, px
+EQ_HIT_RADIUS = 12
 SCOPE_CAMERA = 5.0
 WAVE_RGB_NEW, WAVE_RGB_OLD = np.array([125, 175, 255]), np.array([150, 90, 255])
 SPEC_RGB_NEW, SPEC_RGB_OLD = np.array([200, 140, 255]), np.array([80, 70, 230])
@@ -560,14 +468,22 @@ class Scope3D(QWidget):
     MIX/CH toggle: one scene for the mix, or L | R side by side. Channel mute
     buttons on the right: a muted channel's scene disappears and the other
     takes the whole area; both muted = dark. Mono input = one scene.
-    Drag = orbit, wheel = zoom, double-click = reset view."""
+    The 5-band EQ curve stands on the YZ plane (log Hz along Y, gain along Z):
+    drag a node = move it, wheel over a node = Q, double-click a node = reset it.
+    Elsewhere: drag = orbit, wheel = zoom, double-click = reset view."""
 
-    def __init__(self, engine, mode="mix", on_mute_change=None, on_mode_change=None):
+    def __init__(self, engine, mode="mix", on_mute_change=None, on_mode_change=None,
+                 on_eq_change=None, on_eq_commit=None):
         super().__init__()
         self.engine = engine
         self.mode = mode if mode in ("mix", "channels") else "mix"
         self.on_mute_change = on_mute_change
         self.on_mode_change = on_mode_change
+        self.on_eq_change = on_eq_change    # every drag/wheel step (band list refresh)
+        self.on_eq_commit = on_eq_commit    # end of an edit (persist)
+        self._cams = []                     # [(scene rect, camera)] from the last paint
+        self._eq_drag = None                # (band index, camera)
+        self._eq_freqs = np.logspace(np.log10(SPEC_FREQ_LO), np.log10(SPEC_FREQ_HI), 300)
         self.mono = False
         self.live = np.zeros((SCOPE_WINDOW, 2), dtype=np.float32)
         self.wave = np.zeros((SCOPE_FRAMES, 3, 2, SCOPE_POINTS), dtype=np.float32)
@@ -618,7 +534,7 @@ class Scope3D(QWidget):
         """Fit the world box into rect -> (scale, cx, cy) for _project."""
         corners = np.array([(x, y, z) for x in (-SCOPE_DEPTH - 0.1, SCOPE_DEPTH + 0.1)
                             for y in (-SCOPE_Y - 0.2, SCOPE_Y + 0.1)
-                            for z in (-SCOPE_WAVE_Z, SCOPE_SPEC_Z)])
+                            for z in (-max(SCOPE_WAVE_Z, SCOPE_EQ_Z), max(SCOPE_SPEC_Z, SCOPE_EQ_Z))])
         sx, sy = self._project(corners[:, 0], corners[:, 1], corners[:, 2], 1.0, 0.0, 0.0)
         # the box's empty corners overstate its height: favour filling the width
         scale = min((rect.width() - 20) / np.ptp(sx), 1.35 * (rect.height() - 20) / np.ptp(sy)) * self.zoom
@@ -642,6 +558,7 @@ class Scope3D(QWidget):
         p.fillRect(self.rect(), QColor(3, 2, 5))
         area, scenes, buttons = self._layout()
         p.fillRect(area, QColor(0, 0, 0))
+        self._cams = []
         for label, idx, rect in scenes:
             p.save()
             p.setClipRect(rect)
@@ -658,6 +575,7 @@ class Scope3D(QWidget):
     def _paint_scene(self, p, idx, rect, label):
         p.fillRect(rect, SCOPE_BG)
         cam = self._camera(rect)
+        self._cams.append((rect, cam))
 
         def proj(x, y, z):
             return self._project(np.asarray(x, float), np.asarray(y, float), np.asarray(z, float), *cam)
@@ -699,15 +617,116 @@ class Scope3D(QWidget):
             sx, sy = proj(xs, np.broadcast_to(ry, xs.shape), level * SCOPE_SPEC_Z)
             self._stroke_buckets(p, sx, sy, fade[valid], ages[valid], SPEC_RGB_NEW, SPEC_RGB_OLD)
             if valid.sum() > 1:
-                lace = slice(4, SPEC_ROWS, 8)  # constant-frequency lines across time
+                lace = slice(SCOPE_LACE_STEP // 2, SPEC_ROWS, SCOPE_LACE_STEP)  # constant-frequency lines across time
                 p.setPen(QPen(QColor(110, 100, 240, 45), 1.0))
                 p.drawPath(polylines_path(np.ascontiguousarray(sx[:, lace].T),
                                           np.ascontiguousarray(sy[:, lace].T)))
 
         p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        self._paint_eq(p, proj)
         p.setFont(QFont("Consolas", 8, QFont.Bold))
         p.setPen(SCOPE_TEXT)
         p.drawText(QRectF(rect.right() - 90, rect.top() + 4, 84, 14), Qt.AlignRight, label)
+
+    # ---- EQ on the YZ plane -----------------------------------------------------
+    @staticmethod
+    def _freq_to_y(freq):
+        lo, hi = np.log10(SPEC_FREQ_LO), np.log10(SPEC_FREQ_HI)
+        return SCOPE_Y * (-1.0 + 2.0 * (np.log10(freq) - lo) / (hi - lo))
+
+    @staticmethod
+    def _y_to_freq(y):
+        lo, hi = np.log10(SPEC_FREQ_LO), np.log10(SPEC_FREQ_HI)
+        return 10 ** (lo + (y / SCOPE_Y + 1.0) / 2.0 * (hi - lo))
+
+    @staticmethod
+    def _band_yz(band):
+        gain = band.gain_db if band.kind == "peak" else 0.0
+        y = float(np.clip(Scope3D._freq_to_y(band.freq), -SCOPE_Y, SCOPE_Y))
+        return y, gain / DB_RANGE * SCOPE_EQ_Z
+
+    def _paint_eq(self, p, proj):
+        yl, ez = SCOPE_Y, SCOPE_EQ_Z
+        # faint frame of the plane + the +-12 dB lines
+        p.setPen(QPen(QColor(*EQ_RGB, 40), 1.0))
+        for db in (-12, 12):
+            (x0, x1), (y0, y1) = proj([0, 0], [-yl, yl], [db / DB_RANGE * ez] * 2)
+            p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+        for y in (-yl, yl):
+            (x0, x1), (y0, y1) = proj([0, 0], [y, y], [-ez, ez])
+            p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+
+        db = np.clip(self.engine.eq.response_db(self._eq_freqs), -DB_RANGE, DB_RANGE)
+        ys = self._freq_to_y(self._eq_freqs)
+        sx, sy = proj(np.zeros_like(ys), ys, db / DB_RANGE * ez)
+        path = polylines_path(sx[None, :], sy[None, :])
+        for width, alpha in ((5, 40), (1.6, 235)):
+            pen = QPen(QColor(*EQ_RGB, alpha), width)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            p.drawPath(path)
+
+        half = EQ_NODE_HALF
+        for i, band in enumerate(self.engine.eq.bands):
+            y, z = self._band_yz(band)
+            x, yy = (float(v) for v in proj(0.0, y, z))
+            color = QColor(NODE_COLORS[i % len(NODE_COLORS)])
+            off = band.is_off() and band.kind != "peak"
+            if off:
+                color.setAlpha(110)
+            square = QRectF(x - half, yy - half, half * 2, half * 2)
+            p.setPen(QPen(QColor(10, 0, 0), 1.2))
+            p.setBrush(color)
+            p.drawRect(square)
+            p.setFont(QFont("Consolas", 6, QFont.Bold))
+            p.setPen(QColor(15, 0, 0))
+            p.drawText(square, Qt.AlignCenter, f"{band.gain_db:+.0f}" if band.kind == "peak" else band.name)
+            p.setFont(QFont("Consolas", 8, QFont.Bold))
+            label = "OFF" if off else f"{fmt_freq(band.freq)}Hz"
+            label_rect = QRectF(x - 30, yy - half - 15, 60, 13)
+            p.setPen(QColor(0, 0, 0, 210))
+            p.drawText(label_rect.translated(0, 1), Qt.AlignCenter, label)
+            p.setPen(TEXT_BRIGHT)
+            p.drawText(label_rect, Qt.AlignCenter, label)
+            if not off:
+                p.setFont(QFont("Consolas", 7))
+                p.setPen(TEXT_DIM)
+                p.drawText(QRectF(x - 30, yy + half + 1, 60, 11), Qt.AlignCenter, f"Q{band.q:.2f}")
+
+    def _eq_hit(self, pos):
+        """-> (band index, camera) of the nearest node under pos, or None."""
+        best, best_d = None, EQ_HIT_RADIUS ** 2
+        for rect, cam in self._cams:
+            if not rect.contains(pos):
+                continue
+            for i, band in enumerate(self.engine.eq.bands):
+                y, z = self._band_yz(band)
+                x, yy = self._project(0.0, y, z, *cam)
+                d = (pos.x() - x) ** 2 + (pos.y() - yy) ** 2
+                if d <= best_d:
+                    best, best_d = (i, cam), d
+        return best
+
+    def _unproject_yz(self, pos, cam, y, z):
+        """Screen point -> (y, z) on the x = 0 plane, by a few Newton steps
+        from the node's current position (lstsq copes with an edge-on plane)."""
+        target = np.array([pos.x(), pos.y()])
+        v = np.array([y, z], dtype=float)
+        eps = 1e-3
+        for _ in range(4):
+            f0 = np.array(self._project(0.0, v[0], v[1], *cam), dtype=float)
+            fy = np.array(self._project(0.0, v[0] + eps, v[1], *cam), dtype=float)
+            fz = np.array(self._project(0.0, v[0], v[1] + eps, *cam), dtype=float)
+            jac = np.column_stack([(fy - f0) / eps, (fz - f0) / eps])
+            v = v + np.linalg.lstsq(jac, target - f0, rcond=None)[0]
+        return float(v[0]), float(v[1])
+
+    def _eq_changed(self, commit=False):
+        if self.on_eq_change:
+            self.on_eq_change()
+        if commit and self.on_eq_commit:
+            self.on_eq_commit()
+        self.update()
 
     @staticmethod
     def _stroke_buckets(p, sx, sy, fade, ages, rgb_new, rgb_old):
@@ -805,25 +824,53 @@ class Scope3D(QWidget):
                     self.on_mute_change()
                 self.update()
                 return
-        self._orbit = (pos, self.yaw, self.pitch)
+        self._eq_drag = self._eq_hit(pos)
+        if self._eq_drag is None:
+            self._orbit = (pos, self.yaw, self.pitch)
 
     def mouseMoveEvent(self, event):
+        if self._eq_drag is not None:
+            idx, cam = self._eq_drag
+            band = self.engine.eq.bands[idx]
+            y, z = self._unproject_yz(event.position(), cam, *self._band_yz(band))
+            freq = self._y_to_freq(y)
+            if band.kind == "peak":
+                band.set_params(freq=freq, gain_db=z / SCOPE_EQ_Z * DB_RANGE)
+            else:
+                band.set_params(freq=freq)
+            self._eq_changed()
+            return
         if self._orbit is None:
             return
         start, yaw, pitch = self._orbit
         delta = event.position() - start
         self.yaw = yaw + delta.x() * 0.3
-        self.pitch = float(np.clip(pitch - delta.y() * 0.3, 0.0, 85.0))
+        self.pitch = float(np.clip(pitch - delta.y() * 0.3, 0.0, SCOPE_PITCH_MAX))
         self.update()
 
     def mouseReleaseEvent(self, event):
+        if self._eq_drag is not None:
+            self._eq_changed(commit=True)
+        self._eq_drag = None
         self._orbit = None
 
     def mouseDoubleClickEvent(self, event):
+        hit = self._eq_hit(event.position())
+        if hit is not None:
+            self.engine.eq.reset_band(hit[0])
+            self._eq_changed(commit=True)
+            return
         self.yaw, self.pitch, self.zoom = SCOPE_DEFAULT_VIEW
         self.update()
 
     def wheelEvent(self, event):
+        hit = self._eq_hit(event.position())
+        if hit is not None:
+            band = self.engine.eq.bands[hit[0]]
+            band.set_params(q=band.q * Q_WHEEL_STEP ** (event.angleDelta().y() / 120.0))
+            self._eq_changed(commit=True)
+            event.accept()
+            return
         self.zoom = float(np.clip(self.zoom * 1.1 ** (event.angleDelta().y() / 120.0), 0.4, 4.0))
         self.update()
         event.accept()
@@ -1052,7 +1099,7 @@ def retro_button(text, color="#3a1010"):
 class VolumeFader(QWidget):
     """Lateral master-volume fader: monitor-only gain, does not touch the recording."""
 
-    def __init__(self, on_change=None):
+    def __init__(self, on_change=None, on_fx_toggle=None):
         super().__init__()
         self.on_change = on_change
         self.setFixedWidth(64)
@@ -1085,6 +1132,20 @@ class VolumeFader(QWidget):
         """)
         self.slider.valueChanged.connect(self._on_value_changed)
 
+        # FX icon: shows/hides the effects sidebar (EQ bands, DeHummer, ...)
+        self.fx_btn = QPushButton("FX")
+        self.fx_btn.setCheckable(True)
+        self.fx_btn.setFixedSize(26, 16)
+        self.fx_btn.setToolTip("Show / hide effects (EQ bands, DeHummer)")
+        self.fx_btn.setStyleSheet("""
+            QPushButton { background:#2a0a0a; color:#ff8080; border:1px solid #ff2020;
+                font-family:Consolas; font-size:8px; font-weight:bold; border-radius:0px; padding:0; }
+            QPushButton:checked { background:#ff3030; color:#140505; }
+        """)
+        if on_fx_toggle:
+            self.fx_btn.toggled.connect(on_fx_toggle)
+
+        layout.addWidget(self.fx_btn, alignment=Qt.AlignHCenter)
         layout.addWidget(title)
         layout.addWidget(self.slider, stretch=1, alignment=Qt.AlignHCenter)
         layout.addWidget(self.readout)
@@ -1185,11 +1246,13 @@ class RadioRecorder(QWidget):
         self.band_list = BandListPanel()
         self.hum_panel = DeHummerPanel(self.engine.dehummer, self.settings["dehummer_presets"],
                                        on_change=self._on_hum_panel_change)
-        self.eq_widget = ParametricEQ(self.engine, on_change=self._save_settings, band_list=self.band_list,
+        self.eq_widget = ParametricEQ(self.engine, on_change=self._save_settings,
                                       on_hum_change=self.hum_panel.sync_from_engine)
-        self.eq_widget.refresh()
+        self.band_list.refresh(self.engine.eq.bands)
         self.scope = Scope3D(self.engine, mode=self.settings.get("scope_mode", "mix"),
-                             on_mute_change=self._on_mute_change, on_mode_change=self._save_settings)
+                             on_mute_change=self._on_mute_change, on_mode_change=self._save_settings,
+                             on_eq_change=lambda: self.band_list.refresh(self.engine.eq.bands),
+                             on_eq_commit=self._save_settings)
 
         # EQ view + the 3D scope share what used to be the EQ area
         monitors = QVBoxLayout()
@@ -1200,6 +1263,8 @@ class RadioRecorder(QWidget):
 
         side = QWidget()
         side.setFixedWidth(SIDE_PANEL_WIDTH)
+        side.setVisible(False)  # effects sidebar stays hidden until the FX icon calls it
+        self.side_panel = side
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.addWidget(self.band_list)
@@ -1207,7 +1272,7 @@ class RadioRecorder(QWidget):
         side_layout.addStretch(1)
         eq_row.addWidget(side)
 
-        self.volume_fader = VolumeFader(on_change=self._on_volume_changed)
+        self.volume_fader = VolumeFader(on_change=self._on_volume_changed, on_fx_toggle=side.setVisible)
         saved_volume = self.settings.get("master_volume", 100)
         self.volume_fader.set_value(saved_volume)
         self.engine.set_master_volume(saved_volume / 100.0)
@@ -1238,7 +1303,7 @@ class RadioRecorder(QWidget):
         self.rec_btn.clicked.connect(self._on_record)
         self.pause_btn.clicked.connect(self._on_pause)
         self.stop_btn.clicked.connect(self._on_stop)
-        self.flat_btn.clicked.connect(self.eq_widget.reset_flat)
+        self.flat_btn.clicked.connect(self._reset_flat)
         self.folder_btn.clicked.connect(self._open_folder)
 
         self.pause_btn.setEnabled(False)
@@ -1317,6 +1382,12 @@ class RadioRecorder(QWidget):
         self.stop_btn.setEnabled(False)
         if self.power_btn.text() != "POWER":
             self.status_label.setText("MONITORING (not recording)")
+
+    def _reset_flat(self):
+        self.engine.eq.reset_flat()
+        self.band_list.refresh(self.engine.eq.bands)
+        self.scope.update()
+        self._save_settings()
 
     def _open_folder(self):
         os.startfile(str(OUTPUT_DIR))
