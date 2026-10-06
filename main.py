@@ -2,7 +2,6 @@
 """Floating retro-80s 'air-check' recorder: per-device audio tap, a 3D waveform /
 spectral scope with the 5-band EQ on its YZ plane, and a DeHummer."""
 import ctypes
-import os
 import struct
 import sys
 from pathlib import Path
@@ -11,10 +10,10 @@ import numpy as np
 from OpenGL import GL
 from OpenGL.GL import shaders as gl_shaders
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QDataStream, QByteArray
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QDataStream, QByteArray, QUrl
 from PySide6.QtGui import (
     QPainter, QColor, QLinearGradient, QPen, QFont, QBrush, QPainterPath, QRadialGradient,
-    QIcon, QPixmap, QAction, QSurfaceFormat,
+    QIcon, QPixmap, QAction, QSurfaceFormat, QDesktopServices,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
@@ -1247,7 +1246,7 @@ class RadioRecorder(QWidget):
         self._save_settings()
 
     def _open_folder(self):
-        os.startfile(str(OUTPUT_DIR))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(OUTPUT_DIR)))  # Explorer / the Linux file manager
 
     # ---- persisted settings ---------------------------------------------------
     def _select_combo_default(self, combo, saved_name, prefer_substrings):

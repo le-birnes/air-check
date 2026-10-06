@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+# per-machine state: device choices, EQ curve, presets
+settings.json
+# captured takes
+recordings/
+.claude/
