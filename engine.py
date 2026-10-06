@@ -31,7 +31,7 @@ SPECTRUM_RANGE_DB = 50.0  # dynamic range window shown behind the auto-tracked c
 # ---- 3D scope history ---------------------------------------------------------
 TIMELINE_SECONDS = 10.0
 SCOPE_POINTS = 128  # envelope points per history frame (must divide SCOPE_WINDOW)
-SCOPE_FRAME_BLOCKS = 4  # one history frame every 4 blocks (~85 ms): dense enough to read as terrain
+SCOPE_FRAME_BLOCKS = 2  # one history frame every 2 blocks (~43 ms): fast enough to catch clicks
 SCOPE_WINDOW = SCOPE_FRAME_BLOCKS * BLOCK_SIZE  # samples one frame / the live trace covers
 SCOPE_FRAMES = int(np.ceil(TIMELINE_SECONDS * SAMPLE_RATE / BLOCK_SIZE / SCOPE_FRAME_BLOCKS))
 SPEC_FFT = 2048  # analysis window = the last two capture blocks
@@ -218,15 +218,13 @@ class AudioEngine:
     def scope_snapshot(self):
         """Live trace (last SCOPE_WINDOW samples, (n, 2)), then history frames
         oldest -> newest: waveform envelopes (F, 3, [max, min], SCOPE_POINTS) and spectra in dB (F, 3,
-        SPEC_ROWS) for [L, R, mix], each frame's age in seconds, whether the
-        input looks mono, and each frame's capture block number (a stable
-        stamp for grouping frames). Pre-mute, so a channel shows the moment it's unmuted."""
+        SPEC_ROWS) for [L, R, mix], each frame's age in seconds, and whether
+        the input looks mono. Pre-mute, so a channel shows the moment it's unmuted."""
         with self._state_lock:
             order = (np.arange(SCOPE_FRAMES) + self._scope_pos) % SCOPE_FRAMES
-            blocks = self._scope_block[order].copy()
-            ages = (self._block_count - blocks) * BLOCK_SIZE / SAMPLE_RATE
+            ages = (self._block_count - self._scope_block[order]) * BLOCK_SIZE / SAMPLE_RATE
             return (self._live.copy(), self._scope_wave[order], self._scope_spec[order],
-                    ages, self._is_mono, blocks)
+                    ages, self._is_mono)
 
     @property
     def last_error(self):

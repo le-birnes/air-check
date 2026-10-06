@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
 """Floating retro-80s 'air-check' recorder: per-device audio tap, a 3D waveform /
 spectral scope with the 5-band EQ on its YZ plane, and a DeHummer."""
+import ctypes
 import os
 import struct
 import sys
 from pathlib import Path
 
 import numpy as np
+from OpenGL import GL
+from OpenGL.GL import shaders as gl_shaders
 
 from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QDataStream, QByteArray
 from PySide6.QtGui import (
     QPainter, QColor, QLinearGradient, QPen, QFont, QBrush, QPainterPath, QRadialGradient,
-    QIcon, QPixmap, QAction,
+    QIcon, QPixmap, QAction, QSurfaceFormat,
 )
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QSystemTrayIcon, QMenu, QSlider, QGridLayout, QCheckBox, QDoubleSpinBox, QInputDialog,
@@ -22,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from engine import (
     AudioEngine, list_capture_devices, list_monitor_devices, peak_decimate, TIMELINE_SECONDS,
     SCOPE_FRAMES, SCOPE_POINTS, SCOPE_WINDOW, SPEC_ROWS, SPEC_FREQ_LO, SPEC_FREQ_HI,
-    SCOPE_FRAME_BLOCKS, BLOCK_SIZE, SAMPLE_RATE,
 )
 from eq import (
     BAND_DEFS, DEHUMMER_PRESETS, HUM_FREQ_MIN, HUM_FREQ_MAX, HUM_Q_MIN,
@@ -166,10 +169,6 @@ SCOPE_BG = QColor(2, 2, 9)
 SCOPE_TEXT = QColor(170, 170, 215, 170)
 SCOPE_AXIS = QColor(200, 200, 230, 80)
 SCOPE_BTN = QColor(140, 160, 255)
-SCOPE_FADE_SECONDS = 3.0  # history fades out over the last 3 s of the 10 s window
-SCOPE_SLICE_SECONDS = 0.3  # history frames are averaged into slices this long (each one leaves an imprint)
-SCOPE_SLICE_BLOCKS = max(SCOPE_FRAME_BLOCKS, int(round(SCOPE_SLICE_SECONDS * SAMPLE_RATE / BLOCK_SIZE
-                                                       / SCOPE_FRAME_BLOCKS)) * SCOPE_FRAME_BLOCKS)
 SCOPE_DEPTH = 1.5         # world units the 10 s history spans on each side of the live trace
 SCOPE_Y = 1.6             # half-length of the Y axis (the live trace / frequency axis)
 SCOPE_WAVE_Z = 0.55       # waveform full-scale height
@@ -183,10 +182,10 @@ EQ_RGB = (255, 205, 60)
 EQ_NODE_HALF_W, EQ_NODE_HALF_H = 17, 11  # node tag half-size, px (gain line + Q line)
 EQ_HIT_RADIUS = 16
 SCOPE_CAMERA = 5.0
-WAVE_RGB_NEW, WAVE_RGB_OLD = np.array([125, 175, 255]), np.array([150, 90, 255])
-# spectrum heat map: level 0..1 -> deep blue, purple, red, orange, hot yellow
-HEAT_STOPS = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
-HEAT_RGB = np.array([[25, 30, 140], [125, 35, 205], [235, 40, 70], [255, 150, 30], [255, 245, 150]])
+# terrain color by height, bottom -> top: near-black, purple, red, yellow, near-white (never pure black/white)
+TERRAIN_STOPS = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+TERRAIN_RGB = np.array([[14, 6, 24], [105, 35, 185], [225, 40, 60], [255, 205, 45], [250, 245, 225]])
+TERRAIN_BINS = 24          # discrete height colors
 LIVE_RGB = (215, 230, 255)
 
 _PATH_DTYPE = np.dtype([("c", ">i4"), ("x", ">f8"), ("y", ">f8")])
@@ -208,17 +207,131 @@ def polylines_path(xs, ys):
     return path
 
 
-def _smoothstep(f):
-    f = np.clip(f, 0.0, 1.0)
-    return f * f * (3 - 2 * f)
+_TERRAIN_VS = """
+#version 330
+layout(location = 0) in vec3 pos;
+layout(location = 1) in float height;
+uniform vec2 yaw;      // cos, sin
+uniform vec2 pitch;    // cos, sin
+uniform vec3 cam;      // scale, cx, cy (logical px)
+uniform vec2 size;     // widget size (logical px)
+uniform float camera;  // SCOPE_CAMERA
+out float v_height;
+void main() {
+    // exactly Scope3D._project, so the QPainter overlays line up
+    float depth = pos.x * yaw.x - pos.y * yaw.y;
+    float right = pos.x * yaw.y + pos.y * yaw.x;
+    float up = pos.z * pitch.x + depth * pitch.y;
+    float toward = -depth * pitch.x + pos.z * pitch.y;
+    float f = camera / (camera - toward);
+    float sx = cam.y + cam.x * right * f;
+    float sy = cam.z - cam.x * up * f;
+    gl_Position = vec4(2.0 * sx / size.x - 1.0, 1.0 - 2.0 * sy / size.y, -toward / camera, 1.0);
+    v_height = height;
+}
+"""
+
+_TERRAIN_FS = """
+#version 330
+in float v_height;
+uniform vec3 palette[5];
+uniform float bins;
+out vec4 color;
+void main() {
+    // discrete height bands along the palette, never its pure ends
+    float q = (floor(clamp(v_height, 0.0, 0.9999) * bins) + 0.5) / bins * 4.0;
+    int i = int(min(floor(q), 3.0));
+    color = vec4(mix(palette[i], palette[i + 1], q - float(i)), 1.0);
+}
+"""
 
 
-class Scope3D(QWidget):
+class TerrainGL:
+    """GPU half of Scope3D: a (frames, Y) height grid drawn as one
+    depth-tested triangle mesh, so nearer terrain hides farther terrain per
+    pixel and the history reads as one continuous fabric. Lives in the
+    widget's GL context; call only from paintGL (inside native painting)."""
+
+    def __init__(self):
+        self.vao = GL.glGenVertexArrays(1)
+        GL.glBindVertexArray(self.vao)
+        self.program = gl_shaders.compileProgram(
+            gl_shaders.compileShader(_TERRAIN_VS, GL.GL_VERTEX_SHADER),
+            gl_shaders.compileShader(_TERRAIN_FS, GL.GL_FRAGMENT_SHADER), validate=False)
+        self.vbo, self.ibo = GL.glGenBuffers(2)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ibo)
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, False, 16, ctypes.c_void_p(0))
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 1, GL.GL_FLOAT, False, 16, ctypes.c_void_p(12))
+        GL.glBindVertexArray(0)
+        self.loc = {name: GL.glGetUniformLocation(self.program, name)
+                    for name in ("yaw", "pitch", "cam", "size", "camera", "palette", "bins")}
+        self._grid = None  # (k, n) the index buffer was built for
+        self._count = 0
+
+    def begin(self, view, scissor, viewport):
+        """view: yaw deg, pitch deg, (scale, cx, cy), (w, h) logical px.
+        scissor / viewport: (x, y, w, h) in framebuffer pixels."""
+        yaw, pitch, cam, size = view
+        GL.glViewport(*viewport)
+        GL.glEnable(GL.GL_SCISSOR_TEST)
+        GL.glScissor(*scissor)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glDepthFunc(GL.GL_LESS)
+        GL.glDepthMask(GL.GL_TRUE)
+        GL.glDisable(GL.GL_BLEND)
+        GL.glDisable(GL.GL_CULL_FACE)
+        GL.glClear(GL.GL_DEPTH_BUFFER_BIT)
+        GL.glUseProgram(self.program)
+        GL.glUniform2f(self.loc["yaw"], np.cos(np.radians(yaw)), np.sin(np.radians(yaw)))
+        GL.glUniform2f(self.loc["pitch"], np.cos(np.radians(pitch)), np.sin(np.radians(pitch)))
+        GL.glUniform3f(self.loc["cam"], *cam)
+        GL.glUniform2f(self.loc["size"], *size)
+        GL.glUniform1f(self.loc["camera"], SCOPE_CAMERA)
+        GL.glUniform3fv(self.loc["palette"], 5, (TERRAIN_RGB / 255.0).astype(np.float32))
+        GL.glUniform1f(self.loc["bins"], TERRAIN_BINS)
+        GL.glBindVertexArray(self.vao)
+
+    def draw(self, x, ys, z, z_range):
+        """x: (k,) frame positions, ys: (n,), z: (k, n) heights; z_range
+        (bottom, top) maps onto the palette."""
+        k, n = z.shape
+        if k < 2:
+            return
+        lo, hi = z_range
+        verts = np.empty((k, n, 4), dtype=np.float32)
+        verts[..., 0] = x[:, None]
+        verts[..., 1] = ys[None, :]
+        verts[..., 2] = z
+        verts[..., 3] = (z - lo) / (hi - lo)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, verts.nbytes, verts, GL.GL_STREAM_DRAW)
+        if self._grid != (k, n):
+            # two triangles per cell between frame rows r and r + 1 (rows are in age order)
+            v = np.arange(k * n, dtype=np.uint32).reshape(k, n)
+            a, b, c, d = v[:-1, :-1], v[:-1, 1:], v[1:, 1:], v[1:, :-1]
+            idx = np.stack([a, b, c, a, c, d], axis=-1).ravel()
+            GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, GL.GL_STATIC_DRAW)
+            self._grid, self._count = (k, n), len(idx)
+        GL.glDrawElements(GL.GL_TRIANGLES, self._count, GL.GL_UNSIGNED_INT, ctypes.c_void_p(0))
+
+    @staticmethod
+    def end():
+        GL.glBindVertexArray(0)
+        GL.glUseProgram(0)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glDisable(GL.GL_SCISSOR_TEST)
+
+
+class Scope3D(QOpenGLWidget):
     """3D audio scope. Y axis: the live waveform. X+: the last 10 s of waveform
-    receding behind it. X-: the matching spectrum (log Hz along Y) coming
-    forward. History is averaged into 0.3 s slices, and each slice leaves an
-    imprint joined to the next, so both sides read as solids, not meshes.
-    Everything fades out smoothly at 10 s.
+    (max envelope) receding behind it. X-: the matching spectrum (log Hz along
+    Y) coming forward. Both are opaque terrains drawn on the GPU with a depth
+    buffer, one frame every ~43 ms so clicks show, colored by height from
+    near-black (bottom) to near-white (top). Axes, live trace and EQ are
+    QPainter overlays on top.
 
     MIX/CH toggle: one scene for the mix, or L | R side by side. Channel mute
     buttons on the right: a muted channel's scene disappears and the other
@@ -246,27 +359,18 @@ class Scope3D(QWidget):
         self.ages = np.full(SCOPE_FRAMES, 1e9)
         self.yaw, self.pitch, self.zoom = SCOPE_DEFAULT_VIEW
         self._orbit = None
+        self._gl = None  # TerrainGL, created with the GL context
+        fmt = QSurfaceFormat()
+        fmt.setDepthBufferSize(24)
+        fmt.setSamples(4)  # MSAA: smooth terrain edges on the GPU
+        self.setFormat(fmt)
         self.setMinimumHeight(220)
 
-    def update_data(self, live, wave, spec, ages, mono, blocks):
-        """History frames are averaged into SCOPE_SLICE_SECONDS slices: fewer,
-        calmer imprints to draw. Slices are keyed on the capture block, so a
-        slice keeps the same frames as it scrolls back (only the newest one grows)."""
-        self.live, self.mono = live, mono
-        valid = ages < TIMELINE_SECONDS
-        if not valid.any():
-            self.wave, self.spec, self.ages = wave[:0], spec[:0], ages[:0]
-        else:
-            key = blocks[valid] // SCOPE_SLICE_BLOCKS
-            _, inv = np.unique(key, return_inverse=True)
-            n = np.bincount(inv).astype(np.float32)
+    def initializeGL(self):
+        self._gl = TerrainGL()
 
-            def mean(a):
-                out = np.zeros((len(n),) + a.shape[1:], dtype=np.float32)
-                np.add.at(out, inv, a)
-                return out / n.reshape((-1,) + (1,) * (a.ndim - 1))
-
-            self.wave, self.spec, self.ages = mean(wave[valid]), mean(spec[valid]), mean(ages[valid])
+    def update_data(self, live, wave, spec, ages, mono):
+        self.live, self.wave, self.spec, self.ages, self.mono = live, wave, spec, ages, mono
         self.update()
 
     # ---- layout -----------------------------------------------------------------
@@ -324,7 +428,7 @@ class Scope3D(QWidget):
         return cx + scale * right * f, cy - scale * up * f
 
     # ---- painting ---------------------------------------------------------------
-    def paintEvent(self, event):
+    def paintGL(self):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(), QColor(3, 2, 5))
@@ -354,17 +458,16 @@ class Scope3D(QWidget):
 
         self._paint_axes(p, proj)
 
-        ages = self.ages
-        valid = ages < TIMELINE_SECONDS
-        fade = (_smoothstep((TIMELINE_SECONDS - ages) / SCOPE_FADE_SECONDS)
-                * (1.0 - 0.45 * np.clip(ages / TIMELINE_SECONDS, 0, 1)))
-        # X+ waveform / X- spectrum history as solids; the far side goes first
-        if valid.any():
-            sides = [self._paint_wave_solid, self._paint_spec_solid]
-            if np.cos(np.radians(self.yaw)) < 0:  # orbited round: X- is the far side
-                sides.reverse()
-            for paint in sides:
-                paint(p, proj, idx, valid, ages[valid], fade[valid])
+        # X+ waveform / X- spectrum history as opaque GPU terrains (depth-tested, so no draw order)
+        valid = self.ages < TIMELINE_SECONDS
+        if self._gl is not None and valid.sum() > 1:
+            p.beginNativePainting()
+            self._gl.begin((self.yaw, self.pitch, cam, (self.width(), self.height())),
+                           self._device_rect(rect), self._device_rect(QRectF(self.rect())))
+            self._gl.draw(*self._wave_terrain(idx, valid))
+            self._gl.draw(*self._spec_terrain(idx, valid))
+            self._gl.end()
+            p.endNativePainting()
 
         # live trace on the Y axis: the same window a history frame covers
         three = np.column_stack([self.live, self.live.mean(axis=1)])
@@ -482,91 +585,26 @@ class Scope3D(QWidget):
             self.on_eq_commit()
         self.update()
 
-    def _paint_wave_solid(self, p, proj, idx, valid, ages, fade):
-        """X+: each frame's max/min envelope as a filled silhouette receding
-        behind the live trace; stacked back to front they form a solid,
-        dark at the zero line and bright at the peaks."""
-        ys = np.linspace(-SCOPE_Y, SCOPE_Y, SCOPE_POINTS)
-        env = np.clip(self.wave[valid, idx], -1, 1) * SCOPE_WAVE_Z  # (k, 2, P)
-        x = ages / TIMELINE_SECONDS * SCOPE_DEPTH + 0.02
-        xs, yy = x[:, None] * np.ones_like(ys), np.broadcast_to(ys, (len(x), len(ys)))
-        skins = [proj(xs, yy, env[:, 0]), proj(xs, yy, env[:, 1])]  # max and min surfaces
-        t = np.clip(ages / TIMELINE_SECONDS, 0, 1)[:, None]
-        rgb = WAVE_RGB_NEW * (1 - t) + WAVE_RGB_OLD * t
-        # bright at +-full scale, dark at the zero line
-        stops = [(0.0, rgb * 1.0, 0.95), (0.5, rgb * 0.3, 0.8), (1.0, rgb * 1.0, 0.95)]
-        self._fill_skin(p, proj, x, fade, -SCOPE_WAVE_Z, SCOPE_WAVE_Z, skins, stops,
-                        np.minimum(rgb * 1.3, 255))
+    def _device_rect(self, rect):
+        """Logical widget rect -> GL (x, y, w, h) in framebuffer pixels, y up."""
+        dpr = self.devicePixelRatioF()
+        return (int(rect.left() * dpr), int((self.height() - rect.bottom()) * dpr),
+                int(rect.width() * dpr), int(rect.height() * dpr))
 
-    def _paint_spec_solid(self, p, proj, idx, valid, ages, fade):
-        """X-: the spectrum frames coming forward as one solid terrain,
-        heat-mapped by height."""
+    def _wave_terrain(self, idx, valid):
+        """X+: the waveform's max envelope receding behind the live trace. Only
+        the top surface: whatever lies under it is hidden anyway."""
+        ys = np.linspace(-SCOPE_Y, SCOPE_Y, SCOPE_POINTS)
+        z = np.clip(self.wave[valid, idx, 0], -1, 1) * SCOPE_WAVE_Z
+        x = self.ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + 0.02
+        return x, ys, z, (0.0, SCOPE_WAVE_Z)
+
+    def _spec_terrain(self, idx, valid):
+        """X-: the spectrum (log Hz along Y) coming forward."""
         ry = np.linspace(-SCOPE_Y, SCOPE_Y, SPEC_ROWS)
         level = np.clip((self.spec[valid, idx, :] - SCOPE_DB_FLOOR) / (SCOPE_DB_CEIL - SCOPE_DB_FLOOR), 0, 1) ** 1.6
-        x = -(ages / TIMELINE_SECONDS * SCOPE_DEPTH + 0.04)
-        skin = proj(x[:, None] * np.ones_like(ry), np.broadcast_to(ry, level.shape), level * SCOPE_SPEC_Z)
-        ones = np.ones((len(x), 1))
-        stops = [(h, HEAT_RGB[j] * ones, 0.6 + 0.4 * h) for j, h in enumerate(HEAT_STOPS)]
-        # each ridge takes the heat color of its slice's loudest band, lifted
-        peak = level.max(axis=1)
-        ridge = np.column_stack([np.interp(peak, HEAT_STOPS, HEAT_RGB[:, c]) for c in range(3)])
-        self._fill_skin(p, proj, x, fade, 0.0, SCOPE_SPEC_Z, [skin], stops, np.minimum(ridge * 1.25, 255))
-
-    def _fill_skin(self, p, proj, x, fade, z0, z1, skins, stops, ridge_rgb):
-        """Every history slice leaves an imprint: the strip between it and the
-        next older slice is filled, so the slices join into a solid surface
-        instead of a mesh. Strips go farthest first so nearer ones occlude.
-        skins: [(sx, sy)] each (k, n) -- one profile per slice per surface.
-        stops: [(pos, (k, 3) rgb, alpha 0..1)] along world Z, z0 -> z1;
-        each slice's profile also gets a ridge line in ridge_rgb (k, 3)."""
-        if len(x) < 2:
-            return
-        by_age = np.argsort(np.abs(x))
-        older = np.empty_like(by_age)
-        older[by_age[:-1]] = by_age[1:]
-        older[by_age[-1]] = -1
-        k = len(x)
-        (ax, bx), (ay, by) = (np.asarray(v) for v in proj(np.stack([x, x]), np.zeros((2, k)),
-                                                         np.array([[z0], [z1]]) * np.ones(k)))
-        (ux0, ux1), (uy0, uy1) = (np.asarray(v) for v in proj(np.stack([x, x]),
-                                                             np.array([[-SCOPE_Y], [SCOPE_Y]]) * np.ones(k),
-                                                             np.full((2, k), z0)))
-        # run the gradient perpendicular to the slice's Y on screen, so its
-        # color depends on height only, not on where along Y a point sits
-        ux, uy = ux1 - ux0, uy1 - uy0
-        ul = np.maximum(np.hypot(ux, uy), 1e-9)
-        nx, ny = -uy / ul, ux / ul
-        reach = (bx - ax) * nx + (by - ay) * ny
-        reach = np.where(np.abs(reach) < 1.0, -1.0, reach)  # edge-on: keep the gradient defined
-        bx, by = ax + nx * reach, ay + ny * reach
-
-        def brush(i):
-            g = QLinearGradient(float(ax[i]), float(ay[i]), float(bx[i]), float(by[i]))
-            for s, rgb, a in stops:
-                r, gg, b = (int(c) for c in rgb[i])
-                g.setColorAt(float(s), QColor(r, gg, b, int(255 * a * fade[i])))
-            return QBrush(g)
-
-        # strips are dense enough to hide jaggies; antialiasing them is the expensive part
-        p.setRenderHint(QPainter.Antialiasing, False)
-        cos_yaw = np.cos(np.radians(self.yaw))
-        for i in np.argsort(-x * cos_yaw):
-            j = older[i]
-            if fade[i] <= 0.01:
-                continue
-            # a flat-colored ridge: a gradient pen costs as much as the fill
-            r, g, b = (int(c) for c in ridge_rgb[i])
-            fill, ridge = brush(i), QPen(QColor(r, g, b, int(220 * fade[i])), 1.0)
-            for sx, sy in skins:
-                if j >= 0:
-                    p.setPen(Qt.NoPen)
-                    p.setBrush(fill)
-                    p.drawPath(polylines_path(np.concatenate([sx[i], sx[j, ::-1]])[None, :],
-                                              np.concatenate([sy[i], sy[j, ::-1]])[None, :]))
-                p.setBrush(Qt.NoBrush)
-                p.setPen(ridge)
-                p.drawPath(polylines_path(sx[i:i + 1], sy[i:i + 1]))
-        p.setRenderHint(QPainter.Antialiasing, True)
+        x = -(self.ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + 0.04)
+        return x, ry, level * SCOPE_SPEC_Z, (0.0, SCOPE_SPEC_Z)
 
     def _paint_axes(self, p, proj):
         d, wz, yl = SCOPE_DEPTH, SCOPE_WAVE_Z, SCOPE_Y
