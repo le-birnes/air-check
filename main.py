@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Floating retro-80s 'air-check' recorder: per-device audio tap, 5-band EQ curve,
-DeHummer, and a 3D waveform / spectral scope."""
+"""Floating retro-80s 'air-check' recorder: per-device audio tap, a 3D waveform /
+spectral scope with the 5-band EQ on its YZ plane, and a DeHummer."""
 import os
 import struct
 import sys
@@ -11,7 +11,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QDataStream, QByteArray
 from PySide6.QtGui import (
     QPainter, QColor, QLinearGradient, QPen, QFont, QBrush, QPainterPath, QRadialGradient,
-    QIcon, QPixmap, QAction, QImage,
+    QIcon, QPixmap, QAction,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
@@ -24,7 +24,7 @@ from engine import (
     SCOPE_FRAMES, SCOPE_POINTS, SCOPE_WINDOW, SPEC_ROWS, SPEC_FREQ_LO, SPEC_FREQ_HI,
 )
 from eq import (
-    BAND_DEFS, FREQ_MIN, FREQ_MAX, DEHUMMER_PRESETS, HUM_FREQ_MIN, HUM_FREQ_MAX, HUM_Q_MIN,
+    BAND_DEFS, DEHUMMER_PRESETS, HUM_FREQ_MIN, HUM_FREQ_MAX, HUM_Q_MIN,
     HUM_Q_MAX, HUM_GAIN_MIN, HUM_GAIN_MAX, HUM_MAX_HARMONICS,
 )
 import settings as settings_store
@@ -35,9 +35,6 @@ OUTPUT_DIR = Path(__file__).parent / "recordings"
 BG_TOP = QColor(10, 0, 0)
 BG_BOTTOM = QColor(0, 0, 0)
 PANEL_BORDER = QColor(255, 25, 25)
-GRID_COLOR = QColor(255, 25, 25, 55)
-GRID_COLOR_DIM = QColor(120, 20, 20, 60)
-ZERO_LINE = QColor(255, 255, 255, 90)
 TEXT_DIM = QColor(200, 70, 70, 180)
 TEXT_BRIGHT = QColor(255, 190, 190)
 
@@ -57,261 +54,14 @@ NODE_COLORS = [
 ]
 
 DB_RANGE = 15.0  # display range +-15dB (filters clamp at +-12, gives a little headroom)
-
-SPECTRUM_BIN_COUNT = 200  # fixed spectrum resolution
 SIDE_PANEL_WIDTH = 250
-
-
-def freq_to_x(freq, rect):
-    lo, hi = np.log10(FREQ_MIN), np.log10(FREQ_MAX)
-    frac = (np.log10(freq) - lo) / (hi - lo)
-    return rect.left() + frac * rect.width()
-
-
-def db_to_y(db, rect):
-    frac = (db + DB_RANGE) / (2 * DB_RANGE)
-    return rect.bottom() - frac * rect.height()
-
-
-def x_to_freq(x, rect):
-    lo, hi = np.log10(FREQ_MIN), np.log10(FREQ_MAX)
-    frac = min(max((x - rect.left()) / rect.width(), 0.0), 1.0)
-    return 10 ** (lo + frac * (hi - lo))
 
 
 def fmt_freq(freq):
     return f"{freq/1000:.2f}k" if freq >= 1000 else f"{freq:.0f}"
 
 
-HUM_NODE = "hum"
-HUM_DB_MIN = -80.0  # DeHummer overlay uses its own Audition-style 0..-80 dB right-hand scale
-HUM_CURVE_COLOR = QColor(225, 35, 35)
-HUM_AXIS_COLOR = QColor(235, 90, 90, 200)
 Q_WHEEL_STEP = 1.15  # Q multiplier per mouse-wheel notch
-
-
-class ParametricEQ(QWidget):
-    """Live spectrum (left +-15 dB scale) plus the DeHummer notch comb in red
-    on its own 0..-80 dB right-hand scale. The 5-band EQ nodes live on the 3D
-    scope's YZ plane. Drag the hum node = move it, mouse wheel = Q."""
-
-    HIT_RADIUS = 14
-
-    def __init__(self, engine, on_change=None, on_hum_change=None):
-        super().__init__()
-        self.engine = engine
-        self.on_change = on_change
-        self.on_hum_change = on_hum_change
-        self.setMinimumHeight(160)
-
-        self.spectrum_freqs = np.logspace(np.log10(FREQ_MIN), np.log10(FREQ_MAX), SPECTRUM_BIN_COUNT)
-        engine.set_spectrum_bin_count(SPECTRUM_BIN_COUNT)
-        self.spectrum_l = np.zeros(SPECTRUM_BIN_COUNT)
-        self.spectrum_r = np.zeros(SPECTRUM_BIN_COUNT)
-        self.level_db = -60.0
-        self._dragging = False  # dragging the hum node
-        self.hum_freqs = np.logspace(np.log10(FREQ_MIN), np.log10(FREQ_MAX), 900)
-        self.setMouseTracking(True)
-
-    def update_data(self, level_db, spectrum_l, spectrum_r):
-        self.level_db = level_db
-        self.spectrum_l = spectrum_l
-        self.spectrum_r = spectrum_r
-        self.update()
-
-    def plot_rect(self):
-        return QRectF(self.rect()).adjusted(46, 22, -44, -30)
-
-    # ---- painting -----------------------------------------------------------
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        rect = self.plot_rect()
-
-        p.fillRect(self.rect(), QColor(3, 2, 5))
-        p.setPen(QPen(QColor(80, 40, 110), 1))
-        p.drawRect(rect)
-
-        self._draw_grid(p, rect)
-        self._draw_spectrum(p, rect)
-        self._draw_zero_line(p, rect)
-        p.save()
-        p.setClipRect(rect.adjusted(-1, -1, 1, 1))
-        self._draw_hum(p, rect)
-        p.restore()
-        self._draw_hum_axis(p, rect)
-        p.end()
-
-    def _draw_grid(self, p, rect):
-        p.setFont(QFont("Consolas", 8))
-        for f in (50, 100, 200, 500, 1000, 2000, 5000, 10000, 18000):
-            x = freq_to_x(f, rect)
-            p.setPen(QPen(GRID_COLOR_DIM, 1))
-            p.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
-            p.setPen(TEXT_DIM)
-            label = f"{f // 1000}k" if f >= 1000 else str(f)
-            p.drawText(QPointF(x - 10, rect.bottom() + 16), label)
-
-        for db in (-12, -6, 0, 6, 12):
-            y = db_to_y(db, rect)
-            p.setPen(QPen(GRID_COLOR_DIM, 1))
-            p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
-            p.setPen(TEXT_DIM)
-            p.drawText(QPointF(rect.left() - 38, y + 4), f"{db:+d}")
-
-    def _draw_spectrum(self, p, rect):
-        n = len(self.spectrum_l)
-        if n == 0 or n != len(self.spectrum_freqs):
-            return
-        w = max(int(round(rect.width())), 1)
-        h = max(int(round(rect.height())), 1)
-
-        # Composite the whole bar chart as one RGBA image with numpy, then
-        # hand it to Qt as a single drawImage() call -- thousands of individual
-        # fillRect() calls stall the audio thread out of the GIL (glitches).
-        px = rect.left() + np.arange(w) + 0.5
-        lo, hi = np.log10(FREQ_MIN), np.log10(FREQ_MAX)
-        frac = np.clip((px - rect.left()) / rect.width(), 0.0, 1.0)
-        freqs_per_col = 10 ** (lo + frac * (hi - lo))
-        bin_idx = np.clip(np.searchsorted(self.spectrum_freqs, freqs_per_col), 0, n - 1)
-
-        mag_l = self.spectrum_l[bin_idx]
-        mag_r = self.spectrum_r[bin_idx]
-        height_l = mag_l * h * 0.92
-        height_r = mag_r * h * 0.92
-
-        from_bottom = (h - 1 - np.arange(h, dtype=np.float32))[:, None]  # (h,1), 0 at bottom
-        lit_l = from_bottom < height_l[None, :]  # (h,w)
-        lit_r = from_bottom < height_r[None, :]
-        both = lit_l & lit_r
-
-        # L drives red, R drives green -- additive light mixing, so the
-        # overlap reads as yellow. 80% opacity for a single channel, 100% on
-        # the overlap or where one side beats the other by > 50 points.
-        diff = mag_l - mag_r
-        l_boost = (diff > 0.5)[None, :]
-        r_boost = (diff < -0.5)[None, :]
-        alpha_l_only = np.where(l_boost, 255.0, 204.0)
-        alpha_r_only = np.where(r_boost, 255.0, 204.0)
-
-        img = np.zeros((h, w, 4), dtype=np.uint8)
-        img[..., 0] = np.where(lit_l, 255, 0).astype(np.uint8)
-        img[..., 1] = np.where(lit_r, 255, 0).astype(np.uint8)
-        alpha = np.where(both, 255.0,
-                          np.where(lit_l, alpha_l_only,
-                                   np.where(lit_r, alpha_r_only, 0.0)))
-        img[..., 3] = alpha.astype(np.uint8)
-
-        img = np.ascontiguousarray(img)
-        qimg = QImage(img.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
-        p.drawImage(QPointF(rect.left(), rect.top()), qimg)
-
-    def _draw_zero_line(self, p, rect):
-        y = db_to_y(0, rect)
-        p.setPen(QPen(ZERO_LINE, 1, Qt.DotLine))
-        p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
-
-    @staticmethod
-    def _path(freqs, ys, rect):
-        path = QPainterPath()
-        for i, (f, y) in enumerate(zip(freqs, ys)):
-            x = freq_to_x(f, rect)
-            if i == 0:
-                path.moveTo(x, y)
-            else:
-                path.lineTo(x, y)
-        return path
-
-    @staticmethod
-    def _stroke(p, path, color):
-        for width, alpha in ((7, 40), (4, 90), (1.6, 255)):
-            pen = QPen(QColor(color.red(), color.green(), color.blue(), alpha), width)
-            pen.setCapStyle(Qt.RoundCap)
-            pen.setJoinStyle(Qt.RoundJoin)
-            p.setPen(pen)
-            p.drawPath(path)
-
-    # DeHummer overlay: 0 dB at the top, HUM_DB_MIN at the bottom
-    @staticmethod
-    def _hum_y(db, rect):
-        return rect.top() + (db / HUM_DB_MIN) * rect.height()
-
-    @staticmethod
-    def _hum_db(y, rect):
-        return (y - rect.top()) / rect.height() * HUM_DB_MIN
-
-    def _hum_node_pos(self, rect):
-        hum = self.engine.dehummer
-        freq = min(max(hum.freq, FREQ_MIN), FREQ_MAX)
-        return freq_to_x(freq, rect), self._hum_y(hum.gain_db, rect)
-
-    def _draw_hum(self, p, rect):
-        hum = self.engine.dehummer
-        if not hum.enabled:
-            return
-        # insert the exact notch centers so even a Q-3000 hairline reaches its depth
-        centers = [f for f, _ in hum.notch_specs() if FREQ_MIN <= f <= FREQ_MAX]
-        freqs = np.unique(np.concatenate([self.hum_freqs, centers]))
-        db_vals = np.clip(hum.response_db(freqs), HUM_DB_MIN, 0.0)
-        self._stroke(p, self._path(freqs, [self._hum_y(d, rect) for d in db_vals], rect),
-                     HUM_CURVE_COLOR)
-
-    def _draw_hum_axis(self, p, rect):
-        hum = self.engine.dehummer
-        if not hum.enabled:
-            return
-        p.setFont(QFont("Consolas", 7))
-        p.setPen(HUM_AXIS_COLOR)
-        p.drawText(QPointF(rect.right() + 6, rect.top() - 8), "dB")
-        for db in range(0, int(HUM_DB_MIN) - 1, -10):
-            y = self._hum_y(db, rect)
-            p.drawLine(QPointF(rect.right(), y), QPointF(rect.right() + 3, y))
-            p.drawText(QPointF(rect.right() + 6, y + 3), str(db))
-        x, y = self._hum_node_pos(rect)
-        p.setPen(QPen(QColor(20, 0, 0), 1))
-        p.setBrush(QColor(255, 255, 255))
-        p.drawRect(QRectF(x - 4, y - 4, 8, 8))
-        p.setFont(QFont("Consolas", 8, QFont.Bold))
-        p.setPen(QColor(255, 120, 120))
-        p.drawText(QRectF(x - 60, y + 6, 120, 13), Qt.AlignCenter,
-                   f"{fmt_freq(hum.freq)}Hz Q{hum.q:.0f} {hum.gain_db:.0f}dB")
-
-    # ---- mouse interaction (hum node only) -------------------------------------
-    def _hit_hum(self, pos, rect):
-        if not self.engine.dehummer.enabled:
-            return False
-        x, y = self._hum_node_pos(rect)
-        return (pos.x() - x) ** 2 + (pos.y() - y) ** 2 <= self.HIT_RADIUS ** 2
-
-    def mousePressEvent(self, event):
-        self._dragging = self._hit_hum(event.position(), self.plot_rect())
-
-    def mouseMoveEvent(self, event):
-        if not self._dragging:
-            return
-        rect = self.plot_rect()
-        pos = event.position()
-        self.engine.dehummer.set_params(freq=x_to_freq(pos.x(), rect), gain_db=self._hum_db(pos.y(), rect))
-        if self.on_hum_change:
-            self.on_hum_change()
-        self.update()
-
-    def mouseReleaseEvent(self, event):
-        if self._dragging and self.on_change:
-            self.on_change()
-        self._dragging = False
-
-    def wheelEvent(self, event):
-        if not self._hit_hum(event.position(), self.plot_rect()):
-            return
-        hum = self.engine.dehummer
-        hum.set_params(q=hum.q * Q_WHEEL_STEP ** (event.angleDelta().y() / 120.0))
-        if self.on_hum_change:
-            self.on_hum_change()
-        self.update()
-        if self.on_change:
-            self.on_change()
-        event.accept()
 
 
 class VuStrip(QWidget):
@@ -426,13 +176,17 @@ SCOPE_ALPHA_BUCKETS = 10
 SCOPE_HZ_MARKS = (50, 100, 200, 500, 1000, 2000, 5000, 10000)
 SCOPE_DEFAULT_VIEW = (16.0, 52.0, 1.0)  # yaw deg, pitch deg, zoom
 SCOPE_PITCH_MAX = 90.0    # orbit can tilt the floor all the way to a top-down view
-SCOPE_LACE_STEP = 4       # every 4th spectrum row also runs across time (terrain grid)
+SCOPE_LACE_STEP = 1       # spectrum rows that also run across time (1 = full terrain mesh)
 EQ_RGB = (255, 205, 60)
-EQ_NODE_HALF = 7          # node square half-size, px
-EQ_HIT_RADIUS = 12
+EQ_NODE_HALF_W, EQ_NODE_HALF_H = 17, 11  # node tag half-size, px (gain line + Q line)
+EQ_HIT_RADIUS = 16
 SCOPE_CAMERA = 5.0
 WAVE_RGB_NEW, WAVE_RGB_OLD = np.array([125, 175, 255]), np.array([150, 90, 255])
-SPEC_RGB_NEW, SPEC_RGB_OLD = np.array([200, 140, 255]), np.array([80, 70, 230])
+# spectrum heat map: level 0..1 -> deep blue, purple, red, orange, hot yellow
+HEAT_STOPS = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+HEAT_RGB = np.array([[25, 30, 140], [125, 35, 205], [235, 40, 70], [255, 150, 30], [255, 245, 150]])
+HEAT_BINS = 12
+HEAT_FADE_BINS = 4
 LIVE_RGB = (215, 230, 255)
 
 _PATH_DTYPE = np.dtype([("c", ">i4"), ("x", ">f8"), ("y", ">f8")])
@@ -615,12 +369,7 @@ class Scope3D(QWidget):
             level = np.clip((self.spec[valid, idx, :] - SCOPE_DB_FLOOR) / (SCOPE_DB_CEIL - SCOPE_DB_FLOOR), 0, 1) ** 1.6
             xs = -(ages[valid] / TIMELINE_SECONDS * SCOPE_DEPTH + 0.04)[:, None] * np.ones_like(ry)
             sx, sy = proj(xs, np.broadcast_to(ry, xs.shape), level * SCOPE_SPEC_Z)
-            self._stroke_buckets(p, sx, sy, fade[valid], ages[valid], SPEC_RGB_NEW, SPEC_RGB_OLD)
-            if valid.sum() > 1:
-                lace = slice(SCOPE_LACE_STEP // 2, SPEC_ROWS, SCOPE_LACE_STEP)  # constant-frequency lines across time
-                p.setPen(QPen(QColor(110, 100, 240, 45), 1.0))
-                p.drawPath(polylines_path(np.ascontiguousarray(sx[:, lace].T),
-                                          np.ascontiguousarray(sy[:, lace].T)))
+            self._stroke_heat(p, sx, sy, level, fade[valid])
 
         p.setCompositionMode(QPainter.CompositionMode_SourceOver)
         self._paint_eq(p, proj)
@@ -666,7 +415,7 @@ class Scope3D(QWidget):
             p.setPen(pen)
             p.drawPath(path)
 
-        half = EQ_NODE_HALF
+        hw, hh = EQ_NODE_HALF_W, EQ_NODE_HALF_H
         for i, band in enumerate(self.engine.eq.bands):
             y, z = self._band_yz(band)
             x, yy = (float(v) for v in proj(0.0, y, z))
@@ -674,24 +423,24 @@ class Scope3D(QWidget):
             off = band.is_off() and band.kind != "peak"
             if off:
                 color.setAlpha(110)
-            square = QRectF(x - half, yy - half, half * 2, half * 2)
+            # the node is a little two-line tag: gain (or HP/LP) on top, Q below
+            box = QRectF(x - hw, yy - hh, hw * 2, hh * 2)
             p.setPen(QPen(QColor(10, 0, 0), 1.2))
             p.setBrush(color)
-            p.drawRect(square)
-            p.setFont(QFont("Consolas", 6, QFont.Bold))
-            p.setPen(QColor(15, 0, 0))
-            p.drawText(square, Qt.AlignCenter, f"{band.gain_db:+.0f}" if band.kind == "peak" else band.name)
+            p.drawRect(box)
+            p.setPen(QColor(10, 0, 0))
+            p.setFont(QFont("Consolas", 7, QFont.Bold))
+            top = f"{band.gain_db:+.0f}dB" if band.kind == "peak" else band.name
+            p.drawText(QRectF(box.left(), box.top() + 1, box.width(), hh - 1), Qt.AlignCenter, top)
+            p.drawText(QRectF(box.left(), yy, box.width(), hh - 1), Qt.AlignCenter,
+                       "off" if off else f"Q{band.q:.2f}")
             p.setFont(QFont("Consolas", 8, QFont.Bold))
             label = "OFF" if off else f"{fmt_freq(band.freq)}Hz"
-            label_rect = QRectF(x - 30, yy - half - 15, 60, 13)
+            label_rect = QRectF(x - 30, yy - hh - 15, 60, 13)
             p.setPen(QColor(0, 0, 0, 210))
             p.drawText(label_rect.translated(0, 1), Qt.AlignCenter, label)
             p.setPen(TEXT_BRIGHT)
             p.drawText(label_rect, Qt.AlignCenter, label)
-            if not off:
-                p.setFont(QFont("Consolas", 7))
-                p.setPen(TEXT_DIM)
-                p.drawText(QRectF(x - 30, yy + half + 1, 60, 11), Qt.AlignCenter, f"Q{band.q:.2f}")
 
     def _eq_hit(self, pos):
         """-> (band index, camera) of the nearest node under pos, or None."""
@@ -727,6 +476,42 @@ class Scope3D(QWidget):
         if commit and self.on_eq_commit:
             self.on_eq_commit()
         self.update()
+
+    @staticmethod
+    def _stroke_heat(p, sx, sy, level, fade):
+        """Spectrum terrain as a mesh of segments -- along frequency (each
+        frame) and across time (every SCOPE_LACE_STEP row) -- each colored by
+        its level on the heat scale. Segments are grouped into
+        heat x fade buckets so the whole mesh is a few dozen drawPath calls."""
+        fade = np.broadcast_to(fade[:, None], level.shape)
+        parts = [(sx[:, :-1], sx[:, 1:], sy[:, :-1], sy[:, 1:],
+                  (level[:, :-1] + level[:, 1:]) / 2, fade[:, 1:])]
+        if len(level) > 1:
+            lace = slice(0, None, SCOPE_LACE_STEP)
+            parts.append((sx[:-1, lace], sx[1:, lace], sy[:-1, lace], sy[1:, lace],
+                          (level[:-1, lace] + level[1:, lace]) / 2, fade[:-1, lace]))
+        x0, x1, y0, y1, lv, fd = (np.concatenate([part[i].ravel() for part in parts]) for i in range(6))
+        keep = fd > 0.01
+        x0, x1, y0, y1, lv, fd = x0[keep], x1[keep], y0[keep], y1[keep], lv[keep], fd[keep]
+        if not len(lv):
+            return
+        hb = np.minimum((lv * HEAT_BINS).astype(int), HEAT_BINS - 1)
+        fb = np.minimum((fd * HEAT_FADE_BINS).astype(int), HEAT_FADE_BINS - 1)
+        key = hb * HEAT_FADE_BINS + fb
+        order = np.argsort(key, kind="stable")
+        keys, starts = np.unique(key[order], return_index=True)
+        ends = np.append(starts[1:], len(order))
+        # the mesh is dense enough to hide jaggies; antialiasing it costs ~5 ms per frame
+        p.setRenderHint(QPainter.Antialiasing, False)
+        for k, a, b in zip(keys, starts, ends):
+            sel = order[a:b]
+            h = (k // HEAT_FADE_BINS + 0.5) / HEAT_BINS
+            f = (k % HEAT_FADE_BINS + 0.5) / HEAT_FADE_BINS
+            rgb = [int(np.interp(h, HEAT_STOPS, HEAT_RGB[:, c])) for c in range(3)]
+            p.setPen(QPen(QColor(*rgb, int(255 * f * (0.35 + 0.65 * h))), 1.0))
+            p.drawPath(polylines_path(np.column_stack([x0[sel], x1[sel]]),
+                                      np.column_stack([y0[sel], y1[sel]])))
+        p.setRenderHint(QPainter.Antialiasing, True)
 
     @staticmethod
     def _stroke_buckets(p, sx, sy, fade, ages, rgb_new, rgb_old):
@@ -1245,21 +1030,14 @@ class RadioRecorder(QWidget):
         eq_row = QHBoxLayout()
         self.band_list = BandListPanel()
         self.hum_panel = DeHummerPanel(self.engine.dehummer, self.settings["dehummer_presets"],
-                                       on_change=self._on_hum_panel_change)
-        self.eq_widget = ParametricEQ(self.engine, on_change=self._save_settings,
-                                      on_hum_change=self.hum_panel.sync_from_engine)
+                                       on_change=self._save_settings)
         self.band_list.refresh(self.engine.eq.bands)
         self.scope = Scope3D(self.engine, mode=self.settings.get("scope_mode", "mix"),
                              on_mute_change=self._on_mute_change, on_mode_change=self._save_settings,
                              on_eq_change=lambda: self.band_list.refresh(self.engine.eq.bands),
                              on_eq_commit=self._save_settings)
 
-        # EQ view + the 3D scope share what used to be the EQ area
-        monitors = QVBoxLayout()
-        monitors.setSpacing(4)
-        monitors.addWidget(self.eq_widget, stretch=5)
-        monitors.addWidget(self.scope, stretch=7)
-        eq_row.addLayout(monitors, stretch=1)
+        eq_row.addWidget(self.scope, stretch=1)  # the 3D scope owns the whole monitor area
 
         side = QWidget()
         side.setFixedWidth(SIDE_PANEL_WIDTH)
@@ -1413,10 +1191,6 @@ class RadioRecorder(QWidget):
         self.engine.set_master_volume(value / 100.0)
         self._save_settings()
 
-    def _on_hum_panel_change(self):
-        self.eq_widget.update()
-        self._save_settings()
-
     def _on_mute_change(self):
         self.scope.update()
         self._save_settings()
@@ -1482,8 +1256,7 @@ class RadioRecorder(QWidget):
         QApplication.instance().quit()
 
     def _tick(self):
-        db_l, db_r, _waveform, spectrum_l, spectrum_r = self.engine.snapshot()
-        self.eq_widget.update_data(max(db_l, db_r), spectrum_l, spectrum_r)
+        db_l, db_r = self.engine.snapshot()[:2]
         self.vu.set_levels(db_l, db_r)
         self.scope.update_data(*self.engine.scope_snapshot())
         if self.engine.last_error:
